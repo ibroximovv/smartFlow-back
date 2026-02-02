@@ -9,6 +9,7 @@ import { AuthModule } from './v1/auth/auth.module';
 import { AdminModule } from './v1/admin/admin.module';
 import { BudgetModule } from './v1/budget/budget.module';
 import { BullModule } from '@nestjs/bullmq';
+import { DocumentGateway } from 'src/gateways/document.gateway';
 
 @Module({
   imports: [
@@ -34,6 +35,6 @@ import { BullModule } from '@nestjs/bullmq';
       },
     }),
   ],
-  providers: [],
+  providers: [DocumentGateway],
 })
 export class AppModule { }

@@ -10,6 +10,8 @@ import { Budget, BudgetSchema } from '@common/schema/budget.schema';
 import { Asset, AssetSchema } from '@common/schema/asset.schema';
 import { Workflow, WorkflowSchema } from '@common/schema/workflow.schema';
 import { DocumentGateway } from 'src/gateways/document.gateway';
+import { PdfService } from 'src/services/pdf.service';
+import { PdfProcessor } from 'src/services/pdf.processor';
 
 @Module({
   imports: [
@@ -22,7 +24,7 @@ import { DocumentGateway } from 'src/gateways/document.gateway';
     ]),
     BullModule.registerQueue({ name: 'pdf-queue' }),
   ],
-  providers: [DocumentService, ApprovalService, DocumentGateway],
+  providers: [DocumentService, ApprovalService, DocumentGateway, PdfService, PdfProcessor],
   controllers: [DocumentController],
   exports: [DocumentService, ApprovalService],
 })

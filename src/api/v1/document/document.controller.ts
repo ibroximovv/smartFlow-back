@@ -1,32 +1,14 @@
-import {
-  Controller,
-  Patch,
-  Post,
-  Get,
-  Body,
-  Param,
-  UseGuards,
-  Request,
-  HttpCode,
-  BadRequestException,
-  NotFoundException,
-  Query,
-} from '@nestjs/common';
+import { Controller, Patch, Post, Get, Body, Param, UseGuards, Request, HttpCode, BadRequestException, NotFoundException, Query, Res, StreamableFile, } from '@nestjs/common';
 import { DocumentService } from './document.service';
 import { ApprovalService, ApprovalPayloadDto } from './approval.service';
 import { CreateDocumentDto } from './dto/create-document.dto';
-
 import { RequestWithUser } from '@common/types';
-import {
-  ApiTags,
-  ApiBearerAuth,
-  ApiOperation,
-  ApiResponse,
-  ApiParam,
-  ApiBody,
-} from '@nestjs/swagger';
+import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse, ApiParam, ApiBody, } from '@nestjs/swagger';
 import { AuthGuard } from '@common/guards/auth.guard';
 import { GetDocumentDto } from './dto/get-document.dto';
+
+import * as fs from 'fs';
+import * as path from 'path';
 
 @ApiTags('Documents')
 @ApiBearerAuth()
@@ -36,7 +18,7 @@ export class DocumentController {
   constructor(
     private readonly documentService: DocumentService,
     private readonly approvalService: ApprovalService,
-  ) {}
+  ) { }
 
   @Post()
   @HttpCode(201)
@@ -79,9 +61,8 @@ export class DocumentController {
   @Patch(':id/submit')
   @HttpCode(200)
   @ApiOperation({
-    summary: 'Submit document for review (DRAFT → IN_REVIEW)',
-    description:
-      'Only the creator can submit. Creator must have REVIEWER, ADMIN, or SUPERADMIN role.',
+    summary: '(DRAFT → SUBMITTED)',
+    description: 'Only the document creator can submit. No role restrictions.',
   })
   @ApiParam({ name: 'id', type: String, description: 'Document ID' })
   @ApiBody({
@@ -93,8 +74,8 @@ export class DocumentController {
     },
   })
   @ApiResponse({ status: 200, description: 'Document submitted successfully' })
-  @ApiResponse({ status: 400, description: 'Bad request' })
-  @ApiResponse({ status: 403, description: 'Forbidden - Invalid role or not creator' })
+  @ApiResponse({ status: 400, description: 'Bad request - Document must be in DRAFT status' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Only creator can submit' })
   @ApiResponse({ status: 404, description: 'Document not found' })
   async submitDocument(
     @Request() req: RequestWithUser,
@@ -106,20 +87,59 @@ export class DocumentController {
     });
   }
 
+  @Patch(':id/review')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: '(SUBMITTED → IN_REVIEW → WAITING_APPROVAL)',
+    description: `
+    Review document according to workflow steps:
+    - User role must match current step's required role
+    - If steps.length = 1: SUBMITTED → WAITING_APPROVAL
+    - If steps.length > 1: SUBMITTED → IN_REVIEW → ... → WAITING_APPROVAL
+    
+    Each step must be reviewed by users with the specified role.
+    `,
+  })
+  @ApiParam({ name: 'id', type: String, description: 'Document ID' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        comment: { type: 'string', example: 'Reviewed and approved for next step' },
+      },
+    },
+  })
+  @ApiResponse({ status: 200, description: 'Document reviewed successfully' })
+  @ApiResponse({ status: 400, description: 'Bad request - Invalid status' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Invalid role for current step' })
+  @ApiResponse({ status: 404, description: 'Document not found' })
+  async reviewDocument(
+    @Request() req: RequestWithUser,
+    @Param('id') documentId: string,
+    @Body() body: { comment?: string },
+  ) {
+    return this.approvalService.reviewDocument(req, documentId, {
+      comment: body.comment,
+    });
+  }
+
   @Patch(':id/approve')
   @HttpCode(200)
   @ApiOperation({
-    summary: 'Approve or reject document',
+    summary: '(WAITING_APPROVAL → APPROVED or REJECTED/DRAFT)',
     description: `
-    Handle document approval/rejection based on status:
+    Final approval or rejection by APPROVER, ADMIN, or SUPER_ADMIN:
     
-    IN_REVIEW (Reviewer):
-    - Approve: Move to next review step or WAITING_APPROVAL if last step
-    - Reject: Return to DRAFT
+    APPROVE:
+    - Execute business logic (expense/leave/asset)
+    - Generate PDF
+    - Status → APPROVED
     
-    WAITING_APPROVAL (Approver):
-    - Approve: Move to APPROVED (execute business logic)
-    - Reject: Return to DRAFT
+    REJECT:
+    - Status → DRAFT
+    - User can edit and resubmit
+    
+    Only APPROVER, ADMIN, or SUPER_ADMIN roles allowed.
     `,
   })
   @ApiParam({ name: 'id', type: String, description: 'Document ID' })
@@ -129,29 +149,34 @@ export class DocumentController {
       properties: {
         action: {
           type: 'string',
-          enum: ['approve', 'reject'],
+          enum: ['APPROVE', 'REJECT'],
           description: 'Action to perform on document',
+          example: 'APPROVE',
         },
         comment: {
           type: 'string',
           description: 'Optional comment for history',
+          example: 'All checks passed, approved',
         },
       },
       required: ['action'],
     },
   })
   @ApiResponse({ status: 200, description: 'Action performed successfully' })
-  @ApiResponse({ status: 400, description: 'Bad request' })
-  @ApiResponse({ status: 403, description: 'Forbidden - Invalid role for this status' })
+  @ApiResponse({ status: 400, description: 'Bad request - Invalid action or status' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Invalid role' })
   @ApiResponse({ status: 404, description: 'Document not found' })
   async approveDocument(
     @Request() req: RequestWithUser,
     @Param('id') documentId: string,
     @Body() payload: ApprovalPayloadDto,
   ) {
-    // Validate payload
     if (!payload.action) {
       throw new BadRequestException('action field is required');
+    }
+
+    if (!['APPROVE', 'REJECT'].includes(payload.action)) {
+      throw new BadRequestException('action must be "APPROVE" or "REJECT"');
     }
 
     return this.approvalService.handleApproval(req, documentId, payload);
@@ -188,25 +213,89 @@ export class DocumentController {
     name: 'status',
     enum: [
       'DRAFT',
+      'SUBMITTED',
       'IN_REVIEW',
       'WAITING_APPROVAL',
       'APPROVED',
       'REJECTED',
-      'SUBMITTED',
     ],
   })
   @ApiResponse({ status: 200, description: 'Documents retrieved' })
-  async getDocumentsByStatus(
-    @Param('status') status: string,
-    @Request() req: RequestWithUser,
-  ) {
-    // Only allow users to see their own documents (optional - depends on requirements)
+  async getDocumentsByStatus(@Param('status') status: string) {
     const documents = await this.documentService.findByStatus(status);
 
     return {
       statusCode: 200,
       message: 'Success',
       data: documents,
+    };
+  }
+
+  @Get(':id/download')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Download document PDF' })
+  @ApiParam({ name: 'id', type: String, description: 'Document ID' })
+  @ApiResponse({ status: 200, description: 'PDF file' })
+  @ApiResponse({ status: 404, description: 'Document or PDF not found' })
+  async downloadPdf(
+    @Param('id') documentId: string,
+    @Res({ passthrough: true }) res: any,
+  ) {
+    const document = await this.documentService.findById(documentId);
+
+    if (!document) {
+      throw new NotFoundException('Document not found');
+    }
+
+    if (!document.pdfUrl) {
+      throw new NotFoundException('PDF not yet generated for this document');
+    }
+
+    const fileName = path.basename(document.pdfUrl);
+    const filePath = path.join(process.cwd(), 'generated-pdfs', fileName);
+
+    if (!fs.existsSync(filePath)) {
+      throw new NotFoundException('PDF file not found on server');
+    }
+
+    const file = fs.createReadStream(filePath);
+
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+    });
+
+    return new StreamableFile(file);
+  }
+
+  @Get(':id/pdf-url')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Get PDF URL or status' })
+  @ApiParam({ name: 'id', type: String, description: 'Document ID' })
+  @ApiResponse({ status: 200, description: 'PDF URL or generation status' })
+  @ApiResponse({ status: 404, description: 'Document not found' })
+  async getPdfUrl(@Param('id') documentId: string) {
+    const document = await this.documentService.findById(documentId);
+
+    if (!document) {
+      throw new NotFoundException('Document not found');
+    }
+
+    if (!document.pdfUrl) {
+      return {
+        statusCode: 200,
+        message: 'PDF generation in progress',
+        data: { pdfUrl: null, status: 'PENDING' },
+      };
+    }
+
+    return {
+      statusCode: 200,
+      message: 'PDF is ready',
+      data: {
+        pdfUrl: document.pdfUrl,
+        status: 'READY',
+      },
     };
   }
 }

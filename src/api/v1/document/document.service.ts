@@ -6,7 +6,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { DocumentEntity } from '@common/schema/document.schema';
 import { HydratedDocument, Model, ClientSession } from 'mongoose';
 import { AssetPayloadDto, ExpensePayloadDto, LeavePayloadDto } from './dto/payload-document.dto';
-import { DocumentType } from '@common/constants';
+import { DocumentAction, DocumentType } from '@common/constants';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { User } from '@common/schema/user.schema';
@@ -86,7 +86,7 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
           {
             userId: creator._id.toString(),
             comment,
-            action: 'CREATE',
+            action: DocumentAction.CREATE,
             timestamp: new Date().toISOString(),
           }
         ]
@@ -173,6 +173,7 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
       payload: obj.payload,
       creatorId: obj.creatorId?.toString ? obj.creatorId.toString() : obj.creatorId,
       rejectionReason: obj.rejectionReason || null,
+      pdfUrl: obj.pdfUrl || null,
       history: (obj.history || []).map(item => ({
         userId: item.userId?.toString ? item.userId.toString() : item.userId,
         action: item.action,
@@ -205,9 +206,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     }
   }
 
-  /**
-   * Find documents by status
-   */
   async findByStatus(status: string) {
     try {
       const documents = await this.model.find({ status });
@@ -217,10 +215,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     }
   }
 
-  /**
-   * Execute business logic based on document type
-   * Called when document is APPROVED
-   */
   async executeBusinessLogic(
     document: HydratedDocument<DocumentEntity>,
     session: ClientSession,
@@ -245,10 +239,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     }
   }
 
-  /**
-   * Process EXPENSE document
-   * Deduct amount from active budget
-   */
   private async processExpense(
     document: HydratedDocument<DocumentEntity>,
     payload: ExpensePayloadDto,

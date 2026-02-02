@@ -22,7 +22,9 @@ export enum DocumentStatus {
 }
 
 export enum DocumentAction {
+  CREATE = 'CREATE',
   SUBMIT = 'SUBMIT',
+  REVIEW = 'REVIEW',
   APPROVE = 'APPROVE',
   REJECT = 'REJECT',
   REQUEST_CHANGES = 'REQUEST_CHANGES',

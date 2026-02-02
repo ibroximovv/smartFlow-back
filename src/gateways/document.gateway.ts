@@ -17,6 +17,7 @@ export class DocumentGateway implements OnGatewayConnection, OnGatewayDisconnect
     const userId = client.handshake.query.userId as string;
     if (userId) {
       this.userSockets.set(userId, client);
+      console.log(`User ${userId} connected with socket ${client.id}`);
       this.logger.log(`User ${userId} connected with socket ${client.id}`);
     }
   }

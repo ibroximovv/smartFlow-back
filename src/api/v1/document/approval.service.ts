@@ -1,8 +1,8 @@
 import {
-  BadRequestException,
-  Injectable,
-  InternalServerErrorException,
-  ForbiddenException,
+    BadRequestException,
+    Injectable,
+    InternalServerErrorException,
+    ForbiddenException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { DocumentEntity } from '@common/schema/document.schema';
@@ -14,10 +14,11 @@ import { Workflow } from '@common/schema/workflow.schema';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { DocumentGateway } from 'src/gateways/document.gateway';
+import { DocumentService } from './document.service';
 
 export interface ApprovalPayloadDto {
-  action: 'approve' | 'reject';
-  comment?: string;
+    action: 'APPROVE' | 'REJECT';
+    comment?: string;
 }
 
 /**
@@ -25,479 +26,507 @@ export interface ApprovalPayloadDto {
  * Convert all IDs to strings, timestamps to ISO format
  */
 function formatDocument(doc: HydratedDocument<DocumentEntity>) {
-  const obj = doc.toObject();
-  
-  return {
-    _id: obj._id?.toString(),
-    serialNumber: obj.serialNumber,
-    type: obj.type,
-    status: obj.status,
-    currentStep: obj.currentStep,
-    payload: obj.payload,
-    creatorId: obj.creatorId?.toString ? obj.creatorId.toString() : obj.creatorId,
-    rejectionReason: obj.rejectionReason || null,
-    history: (obj.history || []).map(item => ({
-      userId: item.userId?.toString ? item.userId.toString() : item.userId,
-      action: item.action,
-      comment: item.comment || null,
-      timestamp: item.timestamp instanceof Date 
-        ? item.timestamp.toISOString() 
-        : item.timestamp,
-    })),
-    createdAt: obj.createdAt instanceof Date 
-      ? obj.createdAt.toISOString() 
-      : obj.createdAt,
-    updatedAt: obj.updatedAt instanceof Date 
-      ? obj.updatedAt.toISOString() 
-      : obj.updatedAt,
-  };
+    const obj = doc.toObject();
+
+    return {
+        _id: obj._id?.toString(),
+        serialNumber: obj.serialNumber,
+        type: obj.type,
+        status: obj.status,
+        currentStep: obj.currentStep,
+        payload: obj.payload,
+        creatorId: obj.creatorId?.toString ? obj.creatorId.toString() : obj.creatorId,
+        pdfUrl: obj.pdfUrl || null,
+        rejectionReason: obj.rejectionReason || null,
+        history: (obj.history || []).map(item => ({
+            userId: item.userId?.toString ? item.userId.toString() : item.userId,
+            action: item.action,
+            comment: item.comment || null,
+            timestamp: item.timestamp instanceof Date
+                ? item.timestamp.toISOString()
+                : item.timestamp,
+        })),
+        createdAt: obj.createdAt instanceof Date
+            ? obj.createdAt.toISOString()
+            : obj.createdAt,
+        updatedAt: obj.updatedAt instanceof Date
+            ? obj.updatedAt.toISOString()
+            : obj.updatedAt,
+    };
 }
 
 @Injectable()
 export class ApprovalService {
-  constructor(
-    @InjectModel(DocumentEntity.name)
-    private documentModel: Model<HydratedDocument<DocumentEntity>>,
-    @InjectModel(User.name) private userModel: Model<HydratedDocument<User>>,
-    @InjectModel(Workflow.name)
-    private workflowModel: Model<HydratedDocument<Workflow>>,
-    @InjectQueue('pdf-queue') private pdfQueue: Queue,
-    private readonly documentGateway: DocumentGateway,
-  ) {}
+    constructor(
+        @InjectModel(DocumentEntity.name)
+        private documentModel: Model<HydratedDocument<DocumentEntity>>,
+        @InjectModel(User.name) private userModel: Model<HydratedDocument<User>>,
+        @InjectModel(Workflow.name)
+        private workflowModel: Model<HydratedDocument<Workflow>>,
+        @InjectQueue('pdf-queue') private pdfQueue: Queue,
+        private readonly documentGateway: DocumentGateway,
+        private readonly documentService: DocumentService,
+    ) { }
 
-  /**
-   * Check if user has reviewer role
-   */
-  private async checkReviewRole(userId: string): Promise<boolean> {
-    const user = await this.userModel.findById(userId);
-    if (!user) {
-      throw new BadRequestException('User not found');
-    }
-    const reviewRoles = [UserRole.REVIEWER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
-    return reviewRoles.includes(user.role);
-  }
+    /**
+     * Submit document for review
+     * DRAFT → SUBMITTED
+     * Hech qanday role tekshirmaydi, faqat creator ekanligini tekshiradi
+     */
+    async submitForReview(
+        req: RequestWithUser,
+        documentId: string,
+        data: { comment?: string },
+    ) {
+        const session = await this.documentModel.db.startSession();
+        session.startTransaction();
 
-  /**
-   * Check if user has approver role
-   */
-  private async checkApprovalRole(userId: string): Promise<boolean> {
-    const user = await this.userModel.findById(userId);
-    if (!user) {
-      throw new BadRequestException('User not found');
-    }
-    const approvalRoles = [UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
-    return approvalRoles.includes(user.role);
-  }
+        try {
+            const document = await this.documentModel
+                .findById(documentId)
+                .session(session);
 
-  /**
-   * Submit document for review
-   * DRAFT → IN_REVIEW
-   */
-  async submitForReview(
-    req: RequestWithUser,
-    documentId: string,
-    data: { comment?: string },
-  ) {
-    const session = await this.documentModel.db.startSession();
-    session.startTransaction();
+            if (!document) {
+                throw new BadRequestException('Document not found');
+            }
 
-    try {
-      const hasReviewRole = await this.checkReviewRole(req['user'].id);
-      if (!hasReviewRole) {
-        throw new ForbiddenException(
-          'Only REVIEWER, ADMIN, or SUPER_ADMIN can submit documents for review',
-        );
-      }
+            // Faqat creator submit qilishi mumkin
+            if (document.creatorId.toString() !== req['user'].id) {
+                throw new ForbiddenException('Only the creator can submit this document');
+            }
 
-      const document = await this.documentModel
-        .findById(documentId)
-        .session(session);
-      if (!document) {
-        throw new BadRequestException('Document not found');
-      }
+            if (document.status !== DocumentStatus.DRAFT) {
+                throw new BadRequestException(
+                    `Cannot submit document in ${document.status} status. Must be DRAFT.`,
+                );
+            }
 
-      if (document.creatorId.toString() !== req['user'].id) {
-        throw new ForbiddenException('Only the creator can submit this document');
-      }
+            const creator = await this.userModel
+                .findById(req['user'].id)
+                .session(session);
 
-      if (document.status !== DocumentStatus.DRAFT) {
-        throw new BadRequestException(
-          `Cannot submit document in ${document.status} status. Must be DRAFT.`,
-        );
-      }
+            if (!creator) {
+                throw new BadRequestException('Creator not found');
+            }
 
-      const creator = await this.userModel
-        .findById(req['user'].id)
-        .session(session);
-      if (!creator) {
-        throw new BadRequestException('Creator not found');
-      }
+            // Workflow tekshirish
+            const workflow = await this.workflowModel
+                .findOne({
+                    documentType: document.type,
+                    isActive: true,
+                })
+                .session(session);
 
-      const workflow = await this.workflowModel
-        .findOne({
-          documentType: document.type,
-          isActive: true,
-        })
-        .session(session);
+            if (!workflow || workflow.steps.length === 0) {
+                throw new BadRequestException(
+                    `No active workflow found for ${document.type}`,
+                );
+            }
 
-      if (!workflow || workflow.steps.length === 0) {
-        throw new BadRequestException(
-          `No active workflow found for ${document.type}`,
-        );
-      }
+            document.status = DocumentStatus.SUBMITTED;
+            document.currentStep = 0;
+            document.history.push({
+                userId: creator._id,
+                comment: data.comment,
+                action: DocumentAction.SUBMIT,
+                timestamp: new Date(),
+            });
 
-      document.status = DocumentStatus.IN_REVIEW;
-      document.currentStep = 0;
-      document.history.push({
-        userId: creator._id,
-        comment: data.comment,
-        action: DocumentAction.SUBMIT,
-        timestamp: new Date(),
-      });
+            await document.save({ session });
+            await session.commitTransaction();
 
-      await document.save({ session });
-      await session.commitTransaction();
+            // WebSocket notification
+            this.documentGateway.notifyDocumentStatusChange(
+                document._id.toString(),
+                document.status,
+                {
+                    currentStep: document.currentStep,
+                    comment: data.comment,
+                    actorId: creator._id.toString(),
+                },
+            );
 
-      this.documentGateway.notifyDocumentStatusChange(
-        document._id.toString(),
-        document.status,
-        {
-          currentStep: document.currentStep,
-          comment: data.comment,
-          actorId: creator._id.toString(),
-        },
-      );
-
-      return {
-        statusCode: 200,
-        message: 'Document submitted for review',
-        data: formatDocument(document),
-      };
-    } catch (error) {
-      await session.abortTransaction();
-      if (
-        error instanceof BadRequestException ||
-        error instanceof ForbiddenException
-      ) {
-        throw error;
-      }
-      throw new InternalServerErrorException(
-        error.message || 'Failed to submit document for review',
-      );
-    } finally {
-      session.endSession();
-    }
-  }
-
-  /**
-   * Approve or reject document
-   */
-  async handleApproval(
-    req: RequestWithUser,
-    documentId: string,
-    payload: ApprovalPayloadDto,
-  ) {
-    const { action, comment } = payload;
-
-    if (!['approve', 'reject'].includes(action)) {
-      throw new BadRequestException('Invalid action. Must be "approve" or "reject"');
-    }
-
-    const document = await this.documentModel.findById(documentId);
-    if (!document) {
-      throw new BadRequestException('Document not found');
-    }
-
-    if (action === 'approve') {
-      if (document.status === DocumentStatus.IN_REVIEW) {
-        return this.reviewerApprove(req, document, comment);
-      } else if (document.status === DocumentStatus.WAITING_APPROVAL) {
-        return this.approverApprove(req, document, comment);
-      } else {
-        throw new BadRequestException(
-          `Cannot approve document in ${document.status} status`,
-        );
-      }
-    } else if (action === 'reject') {
-      if (
-        ![DocumentStatus.IN_REVIEW, DocumentStatus.WAITING_APPROVAL].includes(
-          document.status,
-        )
-      ) {
-        throw new BadRequestException(
-          `Cannot reject document in ${document.status} status`,
-        );
-      }
-      return this.rejectDocument(req, document, comment);
-    }
-  }
-
-  /**
-   * Reviewer approves document in IN_REVIEW status
-   */
-  private async reviewerApprove(
-    req: RequestWithUser,
-    document: HydratedDocument<DocumentEntity>,
-    comment?: string,
-  ) {
-    const session = await this.documentModel.db.startSession();
-    session.startTransaction();
-
-    try {
-      const hasReviewRole = await this.checkReviewRole(req['user'].id);
-      if (!hasReviewRole) {
-        throw new ForbiddenException(
-          'Only REVIEWER, ADMIN, or SUPER_ADMIN can approve in IN_REVIEW status',
-        );
-      }
-
-      const reviewer = await this.userModel
-        .findById(req['user'].id)
-        .session(session);
-      if (!reviewer) {
-        throw new BadRequestException('User not found');
-      }
-
-      const freshDoc = await this.documentModel
-        .findById(document._id)
-        .session(session);
-      if (!freshDoc || freshDoc.status !== DocumentStatus.IN_REVIEW) {
-        throw new BadRequestException(
-          'Document is no longer in IN_REVIEW status',
-        );
-      }
-
-      const workflow = await this.workflowModel
-        .findOne({
-          documentType: freshDoc.type,
-          isActive: true,
-        })
-        .session(session);
-
-      if (!workflow) {
-        throw new BadRequestException(
-          `No workflow found for ${freshDoc.type}`,
-        );
-      }
-
-      const nextStepIndex = freshDoc.currentStep + 1;
-      const isLastStep = nextStepIndex >= workflow.steps.length;
-
-      if (isLastStep) {
-        freshDoc.status = DocumentStatus.WAITING_APPROVAL;
-      } else {
-        freshDoc.currentStep = nextStepIndex;
-      }
-
-      freshDoc.history.push({
-        userId: reviewer._id,
-        comment,
-        action: DocumentAction.APPROVE,
-        timestamp: new Date(),
-      });
-
-      await freshDoc.save({ session });
-      await session.commitTransaction();
-
-      this.documentGateway.notifyDocumentStatusChange(
-        freshDoc._id.toString(),
-        freshDoc.status,
-        {
-          currentStep: freshDoc.currentStep,
-          comment,
-          actorId: reviewer._id.toString(),
-        },
-      );
-
-      return {
-        statusCode: 200,
-        message: isLastStep
-          ? 'Document approved by reviewer, awaiting final approval'
-          : 'Document approved by reviewer, moved to next step',
-        data: formatDocument(freshDoc),
-      };
-    } catch (error) {
-      await session.abortTransaction();
-      if (
-        error instanceof BadRequestException ||
-        error instanceof ForbiddenException
-      ) {
-        throw error;
-      }
-      throw new InternalServerErrorException(
-        error.message || 'Failed to approve document',
-      );
-    } finally {
-      session.endSession();
-    }
-  }
-
-  /**
-   * Approver gives final approval in WAITING_APPROVAL status
-   */
-  private async approverApprove(
-    req: RequestWithUser,
-    document: HydratedDocument<DocumentEntity>,
-    comment?: string,
-  ) {
-    const session = await this.documentModel.db.startSession();
-    session.startTransaction();
-
-    try {
-      const hasApprovalRole = await this.checkApprovalRole(req['user'].id);
-      if (!hasApprovalRole) {
-        throw new ForbiddenException(
-          'Only APPROVER, ADMIN, or SUPER_ADMIN can give final approval',
-        );
-      }
-
-      const approver = await this.userModel
-        .findById(req['user'].id)
-        .session(session);
-      if (!approver) {
-        throw new BadRequestException('Approver not found');
-      }
-
-      const freshDoc = await this.documentModel
-        .findById(document._id)
-        .session(session);
-      if (!freshDoc || freshDoc.status !== DocumentStatus.WAITING_APPROVAL) {
-        throw new BadRequestException(
-          'Document is no longer in WAITING_APPROVAL status',
-        );
-      }
-
-      // Execute business logic (placeholder - implement in DocumentService)
-      // await this.executeDocumentBusinessLogic(freshDoc, session);
-
-      freshDoc.status = DocumentStatus.APPROVED;
-      freshDoc.history.push({
-        userId: approver._id,
-        comment,
-        action: DocumentAction.APPROVE,
-        timestamp: new Date(),
-      });
-
-      await freshDoc.save({ session });
-      await session.commitTransaction();
-
-      this.documentGateway.notifyDocumentStatusChange(
-        freshDoc._id.toString(),
-        freshDoc.status,
-        {
-          currentStep: freshDoc.currentStep,
-          comment,
-          actorId: approver._id.toString(),
-        },
-      );
-
-      await this.pdfQueue.add('generate-pdf', {
-        documentId: freshDoc._id.toString(),
-      });
-
-      return {
-        statusCode: 200,
-        message: 'Document approved successfully',
-        data: formatDocument(freshDoc),
-      };
-    } catch (error) {
-      await session.abortTransaction();
-      if (
-        error instanceof BadRequestException ||
-        error instanceof ForbiddenException
-      ) {
-        throw error;
-      }
-      throw new InternalServerErrorException(
-        error.message || 'Failed to approve document',
-      );
-    } finally {
-      session.endSession();
-    }
-  }
-
-  /**
-   * Reject document (returns to DRAFT)
-   */
-  private async rejectDocument(
-    req: RequestWithUser,
-    document: HydratedDocument<DocumentEntity>,
-    comment?: string,
-  ) {
-    const session = await this.documentModel.db.startSession();
-    session.startTransaction();
-
-    try {
-      if (document.status === DocumentStatus.IN_REVIEW) {
-        const hasReviewRole = await this.checkReviewRole(req['user'].id);
-        if (!hasReviewRole) {
-          throw new ForbiddenException(
-            'Only REVIEWER, ADMIN, or SUPER_ADMIN can reject in IN_REVIEW status',
-          );
+            return {
+                statusCode: 200,
+                message: 'Document submitted successfully',
+                data: formatDocument(document),
+            };
+        } catch (error) {
+            await session.abortTransaction();
+            if (
+                error instanceof BadRequestException ||
+                error instanceof ForbiddenException
+            ) {
+                throw error;
+            }
+            throw new InternalServerErrorException(
+                error.message || 'Failed to submit document for review',
+            );
+        } finally {
+            session.endSession();
         }
-      } else if (document.status === DocumentStatus.WAITING_APPROVAL) {
-        const hasApprovalRole = await this.checkApprovalRole(req['user'].id);
-        if (!hasApprovalRole) {
-          throw new ForbiddenException(
-            'Only APPROVER, ADMIN, or SUPER_ADMIN can reject in WAITING_APPROVAL status',
-          );
-        }
-      }
-
-      const rejector = await this.userModel
-        .findById(req['user'].id)
-        .session(session);
-      if (!rejector) {
-        throw new BadRequestException('User not found');
-      }
-
-      const freshDoc = await this.documentModel
-        .findById(document._id)
-        .session(session);
-      if (!freshDoc) {
-        throw new BadRequestException('Document not found');
-      }
-
-      freshDoc.status = DocumentStatus.DRAFT;
-      freshDoc.currentStep = 0;
-      freshDoc.rejectionReason = comment;
-      freshDoc.history.push({
-        userId: rejector._id,
-        comment,
-        action: DocumentAction.REJECT,
-        timestamp: new Date(),
-      });
-
-      await freshDoc.save({ session });
-      await session.commitTransaction();
-
-      this.documentGateway.notifyDocumentStatusChange(
-        freshDoc._id.toString(),
-        freshDoc.status,
-        {
-          rejectionReason: freshDoc.rejectionReason,
-          actorId: rejector._id.toString(),
-        },
-      );
-
-      return {
-        statusCode: 200,
-        message: 'Document rejected and returned to DRAFT',
-        data: formatDocument(freshDoc),
-      };
-    } catch (error) {
-      await session.abortTransaction();
-      if (
-        error instanceof BadRequestException ||
-        error instanceof ForbiddenException
-      ) {
-        throw error;
-      }
-      throw new InternalServerErrorException(
-        error.message || 'Failed to reject document',
-      );
-    } finally {
-      session.endSession();
     }
-  }
+
+    /**
+     * Review document - workflow steps bo'yicha
+     * SUBMITTED → IN_REVIEW → WAITING_APPROVAL
+     * 
+     * Workflow steps bo'yicha har bir stepni tekshiradi:
+     * - steps.length = 1: SUBMITTED → WAITING_APPROVAL
+     * - steps.length > 1: SUBMITTED → IN_REVIEW → ... → WAITING_APPROVAL
+     */
+    async reviewDocument(
+        req: RequestWithUser,
+        documentId: string,
+        data: { comment?: string },
+    ) {
+        const session = await this.documentModel.db.startSession();
+        session.startTransaction();
+
+        try {
+            const document = await this.documentModel
+                .findById(documentId)
+                .session(session);
+
+            if (!document) {
+                throw new BadRequestException('Document not found');
+            }
+
+            // Faqat SUBMITTED yoki IN_REVIEW statusida review mumkin
+            if (![DocumentStatus.SUBMITTED, DocumentStatus.IN_REVIEW].includes(document.status)) {
+                throw new BadRequestException(
+                    `Cannot review document in ${document.status} status. Must be SUBMITTED or IN_REVIEW.`,
+                );
+            }
+
+            const user = await this.userModel
+                .findById(req['user'].id)
+                .session(session);
+
+            if (!user) {
+                throw new BadRequestException('User not found');
+            }
+
+            // Workflow olib kelish
+            const workflow = await this.workflowModel
+                .findOne({
+                    documentType: document.type,
+                    isActive: true,
+                })
+                .session(session);
+
+            if (!workflow || workflow.steps.length === 0) {
+                throw new BadRequestException(
+                    `No active workflow found for ${document.type}`,
+                );
+            }
+
+            // Joriy step index ni aniqlash
+            const currentStepIndex = document.status === DocumentStatus.SUBMITTED ? 0 : document.currentStep;
+            const currentStep = workflow.steps[currentStepIndex];
+
+            if (!currentStep) {
+                throw new BadRequestException('Invalid workflow step');
+            }
+
+            // User role joriy step role'iga mos kelishi kerak
+            if (user.role !== currentStep.role) {
+                throw new ForbiddenException(
+                    `Only users with ${currentStep.role} role can review at this step. Current step: ${currentStepIndex + 1}/${workflow.steps.length}`,
+                );
+            }
+
+            // History ga qo'shish
+            document.history.push({
+                userId: user._id,
+                comment: data.comment,
+                action: DocumentAction.REVIEW,
+                timestamp: new Date(),
+            });
+
+            // Keyingi step bormi?
+            const nextStepIndex = currentStepIndex + 1;
+            const hasMoreSteps = nextStepIndex < workflow.steps.length;
+
+            if (hasMoreSteps) {
+                // Yana steplar bor - IN_REVIEW holatida qoladi
+                document.status = DocumentStatus.IN_REVIEW;
+                document.currentStep = nextStepIndex;
+            } else {
+                // Hamma steplar tugadi - WAITING_APPROVAL ga o'tadi
+                document.status = DocumentStatus.WAITING_APPROVAL;
+                document.currentStep = workflow.steps.length;
+            }
+
+            await document.save({ session });
+            await session.commitTransaction();
+
+            // WebSocket notification
+            this.documentGateway.notifyDocumentStatusChange(
+                document._id.toString(),
+                document.status,
+                {
+                    currentStep: document.currentStep,
+                    totalSteps: workflow.steps.length,
+                    comment: data.comment,
+                    actorId: user._id.toString(),
+                },
+            );
+
+            const message = hasMoreSteps
+                ? `Document reviewed successfully. Step ${nextStepIndex}/${workflow.steps.length} - awaiting ${workflow.steps[nextStepIndex].role} review`
+                : 'All review steps completed. Awaiting final approval from APPROVER';
+
+            return {
+                statusCode: 200,
+                message,
+                data: formatDocument(document),
+            };
+        } catch (error) {
+            await session.abortTransaction();
+            if (
+                error instanceof BadRequestException ||
+                error instanceof ForbiddenException
+            ) {
+                throw error;
+            }
+            throw new InternalServerErrorException(
+                error.message || 'Failed to review document',
+            );
+        } finally {
+            session.endSession();
+        }
+    }
+
+    /**
+     * Handle approval or rejection
+     * WAITING_APPROVAL → APPROVED or DRAFT
+     */
+    async handleApproval(
+        req: RequestWithUser,
+        documentId: string,
+        payload: ApprovalPayloadDto,
+    ) {
+        const { action, comment } = payload;
+
+        // Validate action
+        if (!['APPROVE', 'REJECT'].includes(action)) {
+            throw new BadRequestException('Invalid action. Must be "APPROVE" or "REJECT"');
+        }
+
+        const document = await this.documentModel.findById(documentId);
+        if (!document) {
+            throw new BadRequestException('Document not found');
+        }
+
+        // Faqat WAITING_APPROVAL statusida approve/reject mumkin
+        if (document.status !== DocumentStatus.WAITING_APPROVAL) {
+            throw new BadRequestException(
+                `Cannot ${action.toLowerCase()} document in ${document.status} status. Must be WAITING_APPROVAL.`,
+            );
+        }
+
+        if (action === 'APPROVE') {
+            return this.approveDocument(req, document, comment);
+        } else {
+            return this.rejectDocument(req, document, comment);
+        }
+    }
+
+    /**
+     * Final approval - business logic execute + PDF generate
+     * WAITING_APPROVAL → APPROVED
+     */
+    private async approveDocument(
+        req: RequestWithUser,
+        document: HydratedDocument<DocumentEntity>,
+        comment?: string,
+    ) {
+        const session = await this.documentModel.db.startSession();
+        session.startTransaction();
+
+        try {
+            const user = await this.userModel
+                .findById(req['user'].id)
+                .session(session);
+
+            if (!user) {
+                throw new BadRequestException('User not found');
+            }
+
+            // Faqat APPROVER, ADMIN, SUPER_ADMIN
+            const allowedRoles = [UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
+            if (!allowedRoles.includes(user.role)) {
+                throw new ForbiddenException(
+                    'Only APPROVER, ADMIN, or SUPER_ADMIN can give final approval',
+                );
+            }
+
+            const freshDoc = await this.documentModel
+                .findById(document._id)
+                .session(session);
+
+            if (!freshDoc || freshDoc.status !== DocumentStatus.WAITING_APPROVAL) {
+                throw new BadRequestException(
+                    'Document is no longer in WAITING_APPROVAL status',
+                );
+            }
+
+            // Execute business logic (expense, leave, asset)
+            await this.documentService.executeBusinessLogic(freshDoc, session);
+
+            // Status ni APPROVED ga o'zgartirish
+            freshDoc.status = DocumentStatus.APPROVED;
+            freshDoc.history.push({
+                userId: user._id,
+                comment,
+                action: DocumentAction.APPROVE,
+                timestamp: new Date(),
+            });
+
+            await freshDoc.save({ session });
+            await session.commitTransaction();
+
+            // WebSocket notification
+            this.documentGateway.notifyDocumentStatusChange(
+                freshDoc._id.toString(),
+                freshDoc.status,
+                {
+                    comment,
+                    actorId: user._id.toString(),
+                },
+            );
+
+            // PDF generation queue ga qo'shish
+            await this.pdfQueue.add('generate-pdf', {
+                documentId: freshDoc._id.toString(),
+            });
+
+            // Creator ga notification
+            this.documentGateway.notifyUser(
+                freshDoc.creatorId.toString(),
+                'document:approved',
+                {
+                    documentId: freshDoc._id.toString(),
+                    serialNumber: freshDoc.serialNumber,
+                    approvedBy: user._id.toString(),
+                    message: 'Your document has been approved. PDF generation in progress.',
+                }
+            );
+
+            return {
+                statusCode: 200,
+                message: 'Document approved successfully. PDF generation in progress.',
+                data: formatDocument(freshDoc),
+            };
+        } catch (error) {
+            await session.abortTransaction();
+            if (
+                error instanceof BadRequestException ||
+                error instanceof ForbiddenException
+            ) {
+                throw error;
+            }
+            throw new InternalServerErrorException(
+                error.message || 'Failed to approve document',
+            );
+        } finally {
+            session.endSession();
+        }
+    }
+
+    /**
+     * Reject document
+     * WAITING_APPROVAL → DRAFT
+     */
+    private async rejectDocument(
+        req: RequestWithUser,
+        document: HydratedDocument<DocumentEntity>,
+        comment?: string,
+    ) {
+        const session = await this.documentModel.db.startSession();
+        session.startTransaction();
+
+        try {
+            const user = await this.userModel
+                .findById(req['user'].id)
+                .session(session);
+
+            if (!user) {
+                throw new BadRequestException('User not found');
+            }
+
+            // Faqat APPROVER, ADMIN, SUPER_ADMIN
+            const allowedRoles = [UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
+            if (!allowedRoles.includes(user.role)) {
+                throw new ForbiddenException(
+                    'Only APPROVER, ADMIN, or SUPER_ADMIN can reject at this stage',
+                );
+            }
+
+            const freshDoc = await this.documentModel
+                .findById(document._id)
+                .session(session);
+
+            if (!freshDoc) {
+                throw new BadRequestException('Document not found');
+            }
+
+            // Status ni DRAFT ga qaytarish
+            freshDoc.status = DocumentStatus.DRAFT;
+            freshDoc.currentStep = 0;
+            freshDoc.rejectionReason = comment;
+            freshDoc.history.push({
+                userId: user._id,
+                comment,
+                action: DocumentAction.REJECT,
+                timestamp: new Date(),
+            });
+
+            await freshDoc.save({ session });
+            await session.commitTransaction();
+
+            // WebSocket notification
+            this.documentGateway.notifyDocumentStatusChange(
+                freshDoc._id.toString(),
+                freshDoc.status,
+                {
+                    rejectionReason: comment,
+                    actorId: user._id.toString(),
+                },
+            );
+
+            // Creator ga notification
+            this.documentGateway.notifyUser(
+                freshDoc.creatorId.toString(),
+                'document:rejected',
+                {
+                    documentId: freshDoc._id.toString(),
+                    serialNumber: freshDoc.serialNumber,
+                    rejectedBy: user._id.toString(),
+                    reason: comment,
+                    message: 'Your document has been rejected. Please review and resubmit.',
+                }
+            );
+
+            return {
+                statusCode: 200,
+                message: 'Document rejected and returned to DRAFT. Creator can edit and resubmit.',
+                data: formatDocument(freshDoc),
+            };
+        } catch (error) {
+            await session.abortTransaction();
+            if (
+                error instanceof BadRequestException ||
+                error instanceof ForbiddenException
+            ) {
+                throw error;
+            }
+            throw new InternalServerErrorException(
+                error.message || 'Failed to reject document',
+            );
+        } finally {
+            session.endSession();
+        }
+    }
 }
