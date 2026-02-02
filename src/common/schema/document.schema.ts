@@ -78,7 +78,7 @@ export class DocumentEntity {
     type: DocumentType
 
     @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'User', required: true })
-    creatorId: Types.ObjectId;
+    creatorId: string;
 
     @Prop({ default: 0 })
     currentStep: number;

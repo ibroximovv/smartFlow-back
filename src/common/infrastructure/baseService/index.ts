@@ -67,6 +67,37 @@ export abstract class BaseService<
       }));
     }
 
+    return this.get({
+      mongoQuery,
+      page: pageNum,
+      limit: limitNum,
+      sortBy,
+      sortOrder,
+      skip,
+    });
+
+  }
+
+  async get(opts: {
+    mongoQuery?: any;
+    page?: number;
+    limit?: number;
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
+    skip?: number;
+  } = {}): Promise<PaginatedResponse<TResponseDto>> {
+    const {
+      mongoQuery = {},
+      page = 1,
+      limit = 10,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      skip = 0,
+    } = opts;
+
+    const pageNum = Math.max(1, Number(page) || 1);
+    const limitNum = Math.max(1, Math.min(100, Number(limit) || 10));
+
     const [docs, total] = await Promise.all([
       this.model
         .find(mongoQuery)
@@ -77,15 +108,13 @@ export abstract class BaseService<
       this.model.countDocuments(mongoQuery),
     ]);
 
-    return {
-      data: docs.map(doc => {
-        const obj = doc.toObject({ versionKey: false });
+    const data = docs.map(doc => {
+      const obj = doc.toObject({ versionKey: false });
+      return this.mapToFrontend(obj) as TResponseDto;
+    });
 
-        return {
-          ...obj,
-          _id: obj._id.toString(),
-        };
-      }) as TResponseDto[],
+    return {
+      data,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -93,20 +122,23 @@ export abstract class BaseService<
         pages: Math.ceil(total / limitNum),
       },
     };
-
   }
 
   async findOne(filter: QueryFilter<TDocument>): Promise<TResponseDto | null> {
+    try {
+      return this.getOne(filter as any);
+    } catch (error) {
+      this.handleDatabaseError(error);
+    }
+  }
+
+  async getOne(filter: QueryFilter<TDocument>): Promise<TResponseDto | null> {
     try {
       const doc = await this.model.findOne(filter).exec();
       if (!doc) return null;
 
       const obj = doc.toObject({ versionKey: false });
-
-      return {
-        ...obj,
-        _id: obj._id.toString(),
-      } as TResponseDto;
+      return this.mapToFrontend(obj) as TResponseDto;
     } catch (error) {
       this.handleDatabaseError(error);
     }
@@ -207,12 +239,20 @@ export abstract class BaseService<
       return obj.map(item => this.convertObjectIdsToStrings(item));
     }
 
+    if (obj instanceof Date) {
+      return obj.toISOString();
+    }
+
     if (obj instanceof Types.ObjectId) {
       return obj.toString();
     }
 
-    if (obj.buffer && obj._bsontype === 'ObjectId') {
-      return obj.toString?.() || (obj as any).toHexString?.();
+    if (obj && typeof obj === 'object' && obj.buffer && typeof obj.buffer === 'object') {
+      // try common conversion helpers
+      const hex = (obj as any).toHexString?.();
+      if (hex && typeof hex === 'string') return hex;
+      const str = (obj as any).toString?.();
+      if (str && typeof str === 'string') return str;
     }
 
     const result: any = {};

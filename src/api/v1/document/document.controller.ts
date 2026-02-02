@@ -1,11 +1,13 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, Req, UseGuards, Query } from '@nestjs/common';
+import { Controller, Get, Post, Body, Patch, Param, Delete, Req, UseGuards, Query, BadRequestException } from '@nestjs/common';
 import { DocumentService } from './document.service';
 import { CreateDocumentDto } from './dto/create-document.dto';
 import { UpdateDocumentDto } from './dto/update-document.dto';
 import { RequestWithUser } from '@common/types';
 import { AuthGuard } from '@common/guards/auth.guard';
-import { ApiBearerAuth } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { GetDocumentDto } from './dto/get-document.dto';
+import { DocumentAction } from '@common/constants';
+import { ActionPayloadDto } from './dto/action-payload.dto';
 
 @Controller('document')
 export class DocumentController {
@@ -26,6 +28,27 @@ export class DocumentController {
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.documentService.findById(id);
+  }
+
+  @UseGuards(AuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Perform action on document (submit, approve, reject, request_changes)' })
+  @Patch(':id/action')
+  performAction(
+    @Param('id') id: string,
+    @Body() payload: ActionPayloadDto,
+    @Req() req: RequestWithUser,
+  ) {
+    if (!payload || !payload.action) {
+      throw new BadRequestException('Action is required in request body');
+    }
+
+    return this.documentService.performAction(
+      req,
+      id,
+      payload.action,
+      { comment: payload.comment },
+    );
   }
 
   @Patch(':id')

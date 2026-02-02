@@ -8,6 +8,8 @@ import { WorkflowModule } from './v1/workflow/workflow.module';
 import { AuthModule } from './v1/auth/auth.module';
 import { AdminModule } from './v1/admin/admin.module';
 import { BudgetModule } from './v1/budget/budget.module';
+import { PdfService } from '../services/pdf.service';
+import { DocumentGateway } from '../gateways/document.gateway';
 
 @Module({
   imports: [
@@ -27,5 +29,6 @@ import { BudgetModule } from './v1/budget/budget.module';
     WorkflowModule,
     BudgetModule,
   ],
+  providers: [PdfService, DocumentGateway],
 })
 export class AppModule { }
