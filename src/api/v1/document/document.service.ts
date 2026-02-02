@@ -1,19 +1,17 @@
-import { BadRequestException, Injectable, InternalServerErrorException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, Injectable, InternalServerErrorException } from '@nestjs/common';
 import { CreateDocumentDto } from './dto/create-document.dto';
 import { UpdateDocumentDto } from './dto/update-document.dto';
 import { BaseService } from '@common/infrastructure/baseService';
 import { InjectModel } from '@nestjs/mongoose';
 import { DocumentEntity } from '@common/schema/document.schema';
 import { HydratedDocument, Model, ClientSession } from 'mongoose';
-import { RequestWithUser } from '@common/types';
 import { AssetPayloadDto, ExpensePayloadDto, LeavePayloadDto } from './dto/payload-document.dto';
-import { DocumentAction, DocumentStatus, DocumentType, UserRole } from '@common/constants';
+import { DocumentType } from '@common/constants';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { User } from '@common/schema/user.schema';
 import { Budget } from '@common/schema/budget.schema';
 import { Asset } from '@common/schema/asset.schema';
-import { Workflow } from '@common/schema/workflow.schema';
 
 @Injectable()
 export class DocumentService extends BaseService<HydratedDocument<DocumentEntity>, CreateDocumentDto, UpdateDocumentDto> {
@@ -22,13 +20,15 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     @InjectModel(User.name) private userModel: Model<HydratedDocument<User>>,
     @InjectModel(Budget.name) private budgetModel: Model<HydratedDocument<Budget>>,
     @InjectModel(Asset.name) private assetModel: Model<HydratedDocument<Asset>>,
-    @InjectModel(Workflow.name) private workflowModel: Model<HydratedDocument<Workflow>>
   ) {
-    super(documentModel)
+    super(documentModel);
   }
 
+  /**
+   * Create new document in DRAFT status
+   */
   async createNewDocument(
-    req: RequestWithUser,
+    req: any,
     createDocumentDto: CreateDocumentDto,
   ) {
     try {
@@ -80,47 +80,38 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
         type,
         payload: validatedPayload,
         creatorId: creator._id.toString(),
-        status: DocumentStatus.DRAFT,
-        currentStep: 1,
+        status: 'DRAFT',
+        currentStep: 0,
         history: [
           {
             userId: creator._id.toString(),
             comment,
-            action: DocumentAction.SUBMIT,
-            timestamp: new Date()
+            action: 'CREATE',
+            timestamp: new Date().toISOString(),
           }
         ]
       });
 
-      document.save()
+      await document.save();
 
       return {
         statusCode: 201,
         message: 'Success!',
-        data: {
-          _id: document._id.toString(),
-          serialNumber: document.serialNumber,
-          type: document.type,
-          payload: document.payload,
-          creatorId: document.creatorId.toString(),
-          status: document.status,
-          currentStep: document.currentStep,
-          history: document.history,
-        },
+        data: this.formatDocument(document),
       };
     } catch (error) {
       if (error instanceof BadRequestException) {
         throw error;
       }
-
       throw new InternalServerErrorException(
         error.message || 'Internal server error!',
       );
     }
   }
 
-
-
+  /**
+   * Transform and validate payload based on document type
+   */
   private transformPayload(payload: any, type: DocumentType): any {
     if (!payload || typeof payload !== 'object') {
       throw new BadRequestException('Invalid payload');
@@ -128,6 +119,7 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
 
     const transformed = { ...payload };
 
+    // Fix common typo: currensy → currency
     if (transformed.currensy && !transformed.currency) {
       transformed.currency = transformed.currensy;
       delete transformed.currensy;
@@ -165,258 +157,71 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     return transformed;
   }
 
-  async getNextStep(documentType: DocumentType, currentStep: number) {
-    const workflow = await this.workflowModel.findOne({
-      documentType,
-      isActive: true
-    });
-
-    if (!workflow) {
-      throw new BadRequestException(`No active workflow found for ${documentType}`);
-    }
-
-    const nextStep = workflow.steps.find(s => s.stepOrder === currentStep + 1);
-    return nextStep || null;
+  /**
+   * Format document response
+   * Convert all IDs to strings, timestamps to ISO format
+   */
+  private formatDocument(doc: HydratedDocument<DocumentEntity>) {
+    const obj = doc.toObject();
+    
+    return {
+      _id: obj._id?.toString(),
+      serialNumber: obj.serialNumber,
+      type: obj.type,
+      status: obj.status,
+      currentStep: obj.currentStep,
+      payload: obj.payload,
+      creatorId: obj.creatorId?.toString ? obj.creatorId.toString() : obj.creatorId,
+      rejectionReason: obj.rejectionReason || null,
+      history: (obj.history || []).map(item => ({
+        userId: item.userId?.toString ? item.userId.toString() : item.userId,
+        action: item.action,
+        comment: item.comment || null,
+        timestamp: item.timestamp instanceof Date 
+          ? item.timestamp.toISOString() 
+          : item.timestamp,
+      })),
+      createdAt: obj.createdAt instanceof Date 
+        ? obj.createdAt.toISOString() 
+        : obj.createdAt,
+      updatedAt: obj.updatedAt instanceof Date 
+        ? obj.updatedAt.toISOString() 
+        : obj.updatedAt,
+    };
   }
 
-  async getCurrentStep(documentType: DocumentType, currentStep: number) {
-    const workflow = await this.workflowModel.findOne({
-      documentType,
-      isActive: true
-    });
-
-    if (!workflow) {
-      throw new BadRequestException(`No active workflow found for ${documentType}`);
-    }
-
-    const step = workflow.steps.find(s => s.stepOrder === currentStep);
-    return step || null;
-  }
-
-  async checkUserAuthorization(
-    userId: string,
-    documentId: string,
-    requiredRole?: UserRole,
-  ): Promise<boolean> {
-    const document = await this.model.findById(documentId);
-    if (!document) throw new BadRequestException('Document not found');
-
-    // Creator can always modify DRAFT documents
-    if (document.status === DocumentStatus.DRAFT) {
-      if (document.creatorId.toString() === userId) {
-        return true;
-      }
-    }
-
-    // Check if user has required role for action
-    if (requiredRole) {
-      const user = await this.userModel.findById(userId);
-      if (!user) throw new BadRequestException('User not found');
-      return user.role === requiredRole;
-    }
-
-    return false;
-  }
-
-  async submitDocument(
-    req: RequestWithUser,
-    documentId: string,
-    data: { comment?: string },
-  ) {
-    const session = await this.model.db.startSession();
-    session.startTransaction();
+  /**
+   * Find document by ID
+   */
+  async findById(id: string) {
     try {
-      const document = await this.model.findById(documentId).session(session);
-      if (!document) throw new BadRequestException('Document not found');
-
-      // Only creator can submit DRAFT documents
-      if (document.creatorId.toString() !== req['user'].id) {
-        throw new ForbiddenException('Only the creator can submit this document');
+      const document = await this.model.findById(id);
+      if (!document) {
+        return null;
       }
-
-      if (document.status !== DocumentStatus.DRAFT) {
-        throw new BadRequestException(`Cannot submit document in ${document.status} status`);
-      }
-
-      const creator = await this.userModel.findById(req['user'].id).session(session);
-      if (!creator) throw new BadRequestException('Creator not found');
-
-      // Get first workflow step
-      const workflow = await this.workflowModel.findOne({
-        documentType: document.type,
-        isActive: true
-      }).session(session);
-
-      if (!workflow || workflow.steps.length === 0) {
-        throw new BadRequestException(`No workflow found for ${document.type}`);
-      }
-
-      const firstStep = workflow.steps[0];
-
-      document.status = DocumentStatus.SUBMITTED;
-      document.currentStep = 1;
-      document.history.push({
-        userId: creator._id,
-        comment: data.comment,
-        action: DocumentAction.SUBMIT,
-        timestamp: new Date(),
-      });
-
-      await document.save({ session });
-      await session.commitTransaction();
-
-      return {
-        statusCode: 200,
-        message: 'Document submitted successfully',
-        data: {
-          _id: document._id.toString(),
-          status: document.status,
-          currentStep: document.currentStep,
-        },
-      };
+      return this.formatDocument(document);
     } catch (error) {
-      await session.abortTransaction();
-      if (
-        error instanceof BadRequestException ||
-        error instanceof ForbiddenException
-      ) {
-        throw error;
-      }
-      throw new InternalServerErrorException(
-        error.message || 'Failed to submit document',
-      );
-    } finally {
-      session.endSession();
+      return null;
     }
   }
 
-  async approveForNextStep(
-    req: RequestWithUser,
-    documentId: string,
-    data: { comment?: string },
-  ) {
-    const session = await this.model.db.startSession();
-    session.startTransaction();
+  /**
+   * Find documents by status
+   */
+  async findByStatus(status: string) {
     try {
-      const document = await this.model.findById(documentId).session(session);
-      if (!document) throw new BadRequestException('Document not found');
-
-      // Check if document is in IN_REVIEW status
-      if (document.status !== DocumentStatus.IN_REVIEW) {
-        throw new BadRequestException(
-          `Document must be in IN_REVIEW status, current status: ${document.status}`,
-        );
-      }
-
-      const reviewer = await this.userModel.findById(req['user'].id).session(session);
-      if (!reviewer) throw new BadRequestException('User not found');
-
-      // Get workflow to determine next step
-      const workflow = await this.workflowModel.findOne({
-        documentType: document.type,
-        isActive: true,
-      }).session(session);
-
-      if (!workflow) {
-        throw new BadRequestException(`No workflow found for ${document.type}`);
-      }
-
-      const nextStep = workflow.steps[document.currentStep]; // currentStep is 0-indexed
-      const hasMoreSteps = nextStep && document.currentStep < workflow.steps.length - 1;
-
-      // If there are more review steps, stay in IN_REVIEW, else move to WAITING_APPROVAL
-      const newStatus = hasMoreSteps ? DocumentStatus.IN_REVIEW : DocumentStatus.WAITING_APPROVAL;
-
-      document.status = newStatus;
-      if (hasMoreSteps) {
-        document.currentStep += 1;
-      }
-
-      document.history.push({
-        userId: reviewer._id,
-        comment: data.comment,
-        action: DocumentAction.APPROVE,
-        timestamp: new Date(),
-      });
-
-      await document.save({ session });
-      await session.commitTransaction();
-
-      return {
-        statusCode: 200,
-        message: 'Document approved for next step',
-        data: {
-          _id: document._id.toString(),
-          status: document.status,
-          currentStep: document.currentStep,
-        },
-      };
+      const documents = await this.model.find({ status });
+      return documents.map(doc => this.formatDocument(doc));
     } catch (error) {
-      await session.abortTransaction();
-      if (error instanceof BadRequestException) throw error;
-      throw new InternalServerErrorException(
-        error.message || 'Failed to approve document',
-      );
-    } finally {
-      session.endSession();
+      return [];
     }
   }
 
-  async finalApprove(
-    req: RequestWithUser,
-    documentId: string,
-    data: { comment?: string },
-  ) {
-    const session = await this.model.db.startSession();
-    session.startTransaction();
-    try {
-      const document = await this.model.findById(documentId).session(session);
-      if (!document) throw new BadRequestException('Document not found');
-
-      if (document.status !== DocumentStatus.WAITING_APPROVAL) {
-        throw new BadRequestException(
-          `Document must be in WAITING_APPROVAL status, current: ${document.status}`,
-        );
-      }
-
-      const approver = await this.userModel.findById(req['user'].id).session(session);
-      if (!approver) throw new BadRequestException('Approver not found');
-
-      // Execute business logic based on document type
-      await this.executeBusinessLogic(document, session);
-
-      document.status = DocumentStatus.APPROVED;
-      document.history.push({
-        userId: approver._id,
-        comment: data.comment,
-        action: DocumentAction.APPROVE,
-        timestamp: new Date(),
-      });
-
-      await document.save({ session });
-      await session.commitTransaction();
-
-      return {
-        statusCode: 200,
-        message: 'Document approved successfully',
-        data: {
-          _id: document._id.toString(),
-          status: document.status,
-          message: 'Business logic executed, document approved',
-        },
-      };
-    } catch (error) {
-      await session.abortTransaction();
-      if (error instanceof BadRequestException) throw error;
-      throw new InternalServerErrorException(
-        error.message || 'Failed to approve document',
-      );
-    } finally {
-      session.endSession();
-    }
-  }
-
-  private async executeBusinessLogic(
+  /**
+   * Execute business logic based on document type
+   * Called when document is APPROVED
+   */
+  async executeBusinessLogic(
     document: HydratedDocument<DocumentEntity>,
     session: ClientSession,
   ) {
@@ -441,17 +246,20 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
   }
 
   /**
-   * Process expense: Deduct from budget
+   * Process EXPENSE document
+   * Deduct amount from active budget
    */
   private async processExpense(
     document: HydratedDocument<DocumentEntity>,
     payload: ExpensePayloadDto,
     session: ClientSession,
   ) {
-    const budget = await this.budgetModel.findOne({
-      isActive: true,
-      currency: payload.currency,
-    }).session(session);
+    const budget = await this.budgetModel
+      .findOne({
+        isActive: true,
+        currency: payload.currency,
+      })
+      .session(session);
 
     if (!budget) {
       throw new BadRequestException(`No active budget found for ${payload.currency}`);
@@ -470,13 +278,19 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     await budget.save({ session });
   }
 
+  /**
+   * Process LEAVE document
+   * Deduct leave days from user
+   */
   private async processLeave(
     document: HydratedDocument<DocumentEntity>,
     payload: LeavePayloadDto,
     session: ClientSession,
   ) {
     const user = await this.userModel.findById(document.creatorId).session(session);
-    if (!user) throw new BadRequestException('User not found');
+    if (!user) {
+      throw new BadRequestException('User not found');
+    }
 
     // Check if user has enough leave days
     if (user.availableLeaveDays < payload.totalDays) {
@@ -490,12 +304,15 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     await user.save({ session });
   }
 
+  /**
+   * Process ASSET document
+   * Create new asset record and assign to user
+   */
   private async processAsset(
     document: HydratedDocument<DocumentEntity>,
     payload: AssetPayloadDto,
     session: ClientSession,
   ) {
-    // Create asset record
     const assetDoc = new this.assetModel({
       assetTag: `AST-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       assetType: payload.assetType,
@@ -517,141 +334,20 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     }
   }
 
-  async rejectDocument(
-    req: RequestWithUser,
+  /**
+   * Update document
+   */
+  async updateDocument(
     documentId: string,
-    data: { comment?: string },
+    updateData: Partial<DocumentEntity>,
   ) {
-    const session = await this.model.db.startSession();
-    session.startTransaction();
     try {
-      const document = await this.model.findById(documentId).session(session);
-      if (!document) throw new BadRequestException('Document not found');
-
-      // Can only reject if document is IN_REVIEW or WAITING_APPROVAL
-      if (
-        ![DocumentStatus.IN_REVIEW, DocumentStatus.WAITING_APPROVAL].includes(
-          document.status,
-        )
-      ) {
-        throw new BadRequestException(
-          `Cannot reject document in ${document.status} status`,
-        );
-      }
-
-      const rejector = await this.userModel.findById(req['user'].id).session(session);
-      if (!rejector) throw new BadRequestException('User not found');
-
-      document.status = DocumentStatus.REJECTED;
-      document.rejectionReason = data.comment;
-      document.history.push({
-        userId: rejector._id,
-        comment: data.comment,
-        action: DocumentAction.REJECT,
-        timestamp: new Date(),
+      const updated = await this.model.findByIdAndUpdate(documentId, updateData, {
+        new: true,
       });
-
-      await document.save({ session });
-      await session.commitTransaction();
-
-      return {
-        statusCode: 200,
-        message: 'Document rejected successfully',
-        data: {
-          _id: document._id.toString(),
-          status: document.status,
-        },
-      };
+      return updated ? this.formatDocument(updated) : null;
     } catch (error) {
-      await session.abortTransaction();
-      if (error instanceof BadRequestException) throw error;
-      throw new InternalServerErrorException(
-        error.message || 'Failed to reject document',
-      );
-    } finally {
-      session.endSession();
-    }
-  }
-
-  async requestChanges(
-    req: RequestWithUser,
-    documentId: string,
-    data: { comment?: string },
-  ) {
-    const session = await this.model.db.startSession();
-    session.startTransaction();
-    try {
-      const document = await this.model.findById(documentId).session(session);
-      if (!document) throw new BadRequestException('Document not found');
-
-      if (document.status !== DocumentStatus.IN_REVIEW) {
-        throw new BadRequestException(
-          `Cannot request changes for document in ${document.status} status`,
-        );
-      }
-
-      const requester = await this.userModel.findById(req['user'].id).session(session);
-      if (!requester) throw new BadRequestException('User not found');
-
-      document.status = DocumentStatus.DRAFT;
-      document.currentStep = 0;
-      document.history.push({
-        userId: requester._id,
-        comment: data.comment,
-        action: DocumentAction.REQUEST_CHANGES,
-        timestamp: new Date(),
-      });
-
-      await document.save({ session });
-      await session.commitTransaction();
-
-      return {
-        statusCode: 200,
-        message: 'Changes requested, document returned to DRAFT',
-        data: {
-          _id: document._id.toString(),
-          status: document.status,
-        },
-      };
-    } catch (error) {
-      await session.abortTransaction();
-      if (error instanceof BadRequestException) throw error;
-      throw new InternalServerErrorException(
-        error.message || 'Failed to request changes',
-      );
-    } finally {
-      session.endSession();
-    }
-  }
-
-  async performAction(
-    req: RequestWithUser,
-    documentId: string,
-    action: DocumentAction,
-    data: { comment?: string },
-  ) {
-    switch (action) {
-      case DocumentAction.SUBMIT:
-        return this.submitDocument(req, documentId, data);
-
-      case DocumentAction.APPROVE:
-        const document = await this.model.findById(documentId);
-        if (!document) throw new BadRequestException('Document not found');
-        if (document.status === DocumentStatus.IN_REVIEW) {
-          return this.approveForNextStep(req, documentId, data);
-        } else if (document.status === DocumentStatus.WAITING_APPROVAL) {
-          return this.finalApprove(req, documentId, data);
-        }
-        throw new BadRequestException('Cannot approve document in this status');
-
-      case DocumentAction.REJECT:
-        return this.rejectDocument(req, documentId, data);
-
-      case DocumentAction.REQUEST_CHANGES:
-        return this.requestChanges(req, documentId, data);
-
-      default:
-        throw new BadRequestException(`Unknown action: ${action}`);
+      throw new BadRequestException('Failed to update document');
     }
   }
 }

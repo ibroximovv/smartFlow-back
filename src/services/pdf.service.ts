@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
+import puppeteer from 'puppeteer';
 import { DocumentEntity } from '@common/schema/document.schema';
 import { HydratedDocument } from 'mongoose';
 
@@ -145,5 +146,18 @@ export class PdfService {
         userId: h.userId,
         approvalDate: h.timestamp.toLocaleString(),
       }));
+  }
+
+  async generatePdf(html: string): Promise<Buffer> {
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+    await browser.close();
+    // Convert Uint8Array to Buffer
+    return Buffer.from(pdfBuffer);
   }
 }

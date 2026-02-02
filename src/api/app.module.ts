@@ -8,8 +8,7 @@ import { WorkflowModule } from './v1/workflow/workflow.module';
 import { AuthModule } from './v1/auth/auth.module';
 import { AdminModule } from './v1/admin/admin.module';
 import { BudgetModule } from './v1/budget/budget.module';
-import { PdfService } from '../services/pdf.service';
-import { DocumentGateway } from '../gateways/document.gateway';
+import { BullModule } from '@nestjs/bullmq';
 
 @Module({
   imports: [
@@ -28,7 +27,13 @@ import { DocumentGateway } from '../gateways/document.gateway';
     DocumentModule,
     WorkflowModule,
     BudgetModule,
+    BullModule.forRoot({
+      connection: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: parseInt(process.env.REDIS_PORT || '6379'),
+      },
+    }),
   ],
-  providers: [PdfService, DocumentGateway],
+  providers: [],
 })
 export class AppModule { }

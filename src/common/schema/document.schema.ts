@@ -100,6 +100,12 @@ export class DocumentEntity {
 
     @Prop()
     rejectionReason?: string;
+
+    @Prop()
+    createdAt?: Date;
+
+    @Prop()
+    updatedAt?: Date;
 }
 
 export const DocumentSchema = SchemaFactory.createForClass(DocumentEntity);
