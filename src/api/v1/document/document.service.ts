@@ -6,7 +6,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { DocumentEntity } from '@common/schema/document.schema';
 import { HydratedDocument, Model, ClientSession } from 'mongoose';
 import { AssetPayloadDto, ExpensePayloadDto, LeavePayloadDto } from './dto/payload-document.dto';
-import { DocumentAction, DocumentType } from '@common/constants';
+import { DocumentAction, DocumentStatus, DocumentType } from '@common/constants';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { User } from '@common/schema/user.schema';
@@ -24,9 +24,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     super(documentModel);
   }
 
-  /**
-   * Create new document in DRAFT status
-   */
   async createNewDocument(
     req: any,
     createDocumentDto: CreateDocumentDto,
@@ -109,9 +106,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     }
   }
 
-  /**
-   * Transform and validate payload based on document type
-   */
   private transformPayload(payload: any, type: DocumentType): any {
     if (!payload || typeof payload !== 'object') {
       throw new BadRequestException('Invalid payload');
@@ -157,13 +151,9 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     return transformed;
   }
 
-  /**
-   * Format document response
-   * Convert all IDs to strings, timestamps to ISO format
-   */
   private formatDocument(doc: HydratedDocument<DocumentEntity>) {
     const obj = doc.toObject();
-    
+
     return {
       _id: obj._id?.toString(),
       serialNumber: obj.serialNumber,
@@ -178,22 +168,20 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
         userId: item.userId?.toString ? item.userId.toString() : item.userId,
         action: item.action,
         comment: item.comment || null,
-        timestamp: item.timestamp instanceof Date 
-          ? item.timestamp.toISOString() 
+        timestamp: item.timestamp instanceof Date
+          ? item.timestamp.toISOString()
           : item.timestamp,
       })),
-      createdAt: obj.createdAt instanceof Date 
-        ? obj.createdAt.toISOString() 
+      createdAt: obj.createdAt instanceof Date
+        ? obj.createdAt.toISOString()
         : obj.createdAt,
-      updatedAt: obj.updatedAt instanceof Date 
-        ? obj.updatedAt.toISOString() 
+      updatedAt: obj.updatedAt instanceof Date
+        ? obj.updatedAt.toISOString()
         : obj.updatedAt,
     };
   }
 
-  /**
-   * Find document by ID
-   */
+
   async findById(id: string) {
     try {
       const document = await this.model.findById(id);
@@ -268,10 +256,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     await budget.save({ session });
   }
 
-  /**
-   * Process LEAVE document
-   * Deduct leave days from user
-   */
   private async processLeave(
     document: HydratedDocument<DocumentEntity>,
     payload: LeavePayloadDto,
@@ -294,10 +278,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     await user.save({ session });
   }
 
-  /**
-   * Process ASSET document
-   * Create new asset record and assign to user
-   */
   private async processAsset(
     document: HydratedDocument<DocumentEntity>,
     payload: AssetPayloadDto,
@@ -324,9 +304,6 @@ export class DocumentService extends BaseService<HydratedDocument<DocumentEntity
     }
   }
 
-  /**
-   * Update document
-   */
   async updateDocument(
     documentId: string,
     updateData: Partial<DocumentEntity>,

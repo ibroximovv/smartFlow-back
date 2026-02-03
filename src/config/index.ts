@@ -14,6 +14,8 @@ export type ConfigType = {
     SUPERADMIN_PASSWORD: string
     VERSION: 'v1' | 'v2'
     MONGODB_URI: string
+    OUTLOOK_EMAIL_USER: string
+    OUTLOOK_EMAIL_PASSWORD: string
 }
 
 const requiredVariables = [
@@ -26,7 +28,9 @@ const requiredVariables = [
     'SUPERADMIN_EMAIL',
     'SUPERADMIN_PASSWORD',
     'VERSION',
-    'MONGODB_URI'
+    'MONGODB_URI',
+    'OUTLOOK_EMAIL_USER',
+    'OUTLOOK_EMAIL_PASSWORD'
 ]
 
 const missingVariables = requiredVariables.filter((variable) => {
@@ -49,5 +53,7 @@ export const config: ConfigType = {
     SUPERADMIN_EMAIL: process.env.SUPERADMIN_EMAIL as string,
     SUPERADMIN_PASSWORD: process.env.SUPERADMIN_PASSWORD as string,
     VERSION: process.env.VERSION as 'v1' | 'v2',
-    MONGODB_URI: process.env.MONGODB_URI as string
+    MONGODB_URI: process.env.MONGODB_URI as string,
+    OUTLOOK_EMAIL_USER: process.env.OUTLOOK_EMAIL_USER as string,
+    OUTLOOK_EMAIL_PASSWORD: process.env.OUTLOOK_EMAIL_PASSWORD as string,
 }

@@ -9,7 +9,10 @@ import { AuthModule } from './v1/auth/auth.module';
 import { AdminModule } from './v1/admin/admin.module';
 import { BudgetModule } from './v1/budget/budget.module';
 import { BullModule } from '@nestjs/bullmq';
-import { DocumentGateway } from 'src/gateways/document.gateway';
+import { JwtModule } from '@nestjs/jwt';
+import { MailerModule } from '@nestjs-modules/mailer';
+import { MailService } from 'src/services/mail.service';
+import { MailProcessor } from 'src/services/mail.processor';
 
 @Module({
   imports: [
@@ -19,6 +22,25 @@ import { DocumentGateway } from 'src/gateways/document.gateway';
       serverSelectionTimeoutMS: 10000,
       autoIndex: true,
       family: 4,
+    }),
+    JwtModule.register({
+      secret: config.JWT_SECRET,
+      signOptions: { expiresIn: '1d' }
+    }),
+
+    MailerModule.forRoot({
+      transport: {
+        host: 'smtp.gmail.com', // smpt.outlook.com
+        port: 465, // 587
+        secure: true, // false
+        auth: {
+          user: 'islomaka2323@gmail.com', // process.env.OUTLOOK_EMAIL_USER
+          pass: 'inrv akjo uwqu prdc', // process.env.OUTLOOK_EMAIL_PASSWORD
+        },
+      },
+      defaults: {
+        from: '"SmartFlow" <islomaka2323@gmail.com>',
+      },
     }),
 
     // MongooseModule.forRoot(config.DATABASE_URL),
@@ -34,7 +56,11 @@ import { DocumentGateway } from 'src/gateways/document.gateway';
         port: parseInt(process.env.REDIS_PORT || '6379'),
       },
     }),
+    BullModule.registerQueue({
+      name: 'mail-queue',
+    }),
   ],
-  providers: [DocumentGateway],
+  providers: [MailService, MailProcessor],
+  exports: [MailService],
 })
 export class AppModule { }

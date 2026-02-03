@@ -1,9 +1,4 @@
-import {
-    BadRequestException,
-    Injectable,
-    InternalServerErrorException,
-    ForbiddenException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable, InternalServerErrorException, ForbiddenException, Logger, } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { DocumentEntity } from '@common/schema/document.schema';
 import { HydratedDocument, Model, ClientSession } from 'mongoose';
@@ -21,10 +16,6 @@ export interface ApprovalPayloadDto {
     comment?: string;
 }
 
-/**
- * Helper function to format document response
- * Convert all IDs to strings, timestamps to ISO format
- */
 function formatDocument(doc: HydratedDocument<DocumentEntity>) {
     const obj = doc.toObject();
 
@@ -68,11 +59,41 @@ export class ApprovalService {
         private readonly documentService: DocumentService,
     ) { }
 
-    /**
-     * Submit document for review
-     * DRAFT → SUBMITTED
-     * Hech qanday role tekshirmaydi, faqat creator ekanligini tekshiradi
-     */
+    private async notifyWorkflowStepUsers(
+        document: HydratedDocument<DocumentEntity>,
+        workflow: HydratedDocument<Workflow>,
+    ) {
+        try {
+            // Userlarni role bo'yicha guruhlash
+            const usersByRole = new Map<string, string[]>();
+
+            for (const step of workflow.steps) {
+                const users = await this.userModel.find({ role: step.role });
+                const userIds = users.map(u => u._id.toString());
+                
+                if (!usersByRole.has(step.role)) {
+                    usersByRole.set(step.role, []);
+                }
+                usersByRole.get(step.role)?.push(...userIds);
+            }
+
+            // Gateway orqali notification yuborish
+            await this.documentGateway.notifyWorkflowUsers(
+                document._id.toString(),
+                document.type,
+                document.serialNumber,
+                document.status,
+                document.currentStep,
+                workflow.steps,
+                usersByRole
+            );
+
+            Logger.log(`🔔 Notified workflow users for document ${document.serialNumber}`);
+        } catch (error) {
+            Logger.error('❌ Error notifying workflow users:', error);
+        }
+    }
+
     async submitForReview(
         req: RequestWithUser,
         documentId: string,
@@ -90,7 +111,6 @@ export class ApprovalService {
                 throw new BadRequestException('Document not found');
             }
 
-            // Faqat creator submit qilishi mumkin
             if (document.creatorId.toString() !== req['user'].id) {
                 throw new ForbiddenException('Only the creator can submit this document');
             }
@@ -109,7 +129,6 @@ export class ApprovalService {
                 throw new BadRequestException('Creator not found');
             }
 
-            // Workflow tekshirish
             const workflow = await this.workflowModel
                 .findOne({
                     documentType: document.type,
@@ -135,7 +154,7 @@ export class ApprovalService {
             await document.save({ session });
             await session.commitTransaction();
 
-            // WebSocket notification
+            // WebSocket notification - global status change
             this.documentGateway.notifyDocumentStatusChange(
                 document._id.toString(),
                 document.status,
@@ -145,6 +164,9 @@ export class ApprovalService {
                     actorId: creator._id.toString(),
                 },
             );
+
+            // Workflow userlariga xabarnoma yuborish
+            await this.notifyWorkflowStepUsers(document, workflow);
 
             return {
                 statusCode: 200,
@@ -167,14 +189,6 @@ export class ApprovalService {
         }
     }
 
-    /**
-     * Review document - workflow steps bo'yicha
-     * SUBMITTED → IN_REVIEW → WAITING_APPROVAL
-     * 
-     * Workflow steps bo'yicha har bir stepni tekshiradi:
-     * - steps.length = 1: SUBMITTED → WAITING_APPROVAL
-     * - steps.length > 1: SUBMITTED → IN_REVIEW → ... → WAITING_APPROVAL
-     */
     async reviewDocument(
         req: RequestWithUser,
         documentId: string,
@@ -192,7 +206,6 @@ export class ApprovalService {
                 throw new BadRequestException('Document not found');
             }
 
-            // Faqat SUBMITTED yoki IN_REVIEW statusida review mumkin
             if (![DocumentStatus.SUBMITTED, DocumentStatus.IN_REVIEW].includes(document.status)) {
                 throw new BadRequestException(
                     `Cannot review document in ${document.status} status. Must be SUBMITTED or IN_REVIEW.`,
@@ -207,7 +220,6 @@ export class ApprovalService {
                 throw new BadRequestException('User not found');
             }
 
-            // Workflow olib kelish
             const workflow = await this.workflowModel
                 .findOne({
                     documentType: document.type,
@@ -221,7 +233,6 @@ export class ApprovalService {
                 );
             }
 
-            // Joriy step index ni aniqlash
             const currentStepIndex = document.status === DocumentStatus.SUBMITTED ? 0 : document.currentStep;
             const currentStep = workflow.steps[currentStepIndex];
 
@@ -229,14 +240,12 @@ export class ApprovalService {
                 throw new BadRequestException('Invalid workflow step');
             }
 
-            // User role joriy step role'iga mos kelishi kerak
             if (user.role !== currentStep.role) {
                 throw new ForbiddenException(
                     `Only users with ${currentStep.role} role can review at this step. Current step: ${currentStepIndex + 1}/${workflow.steps.length}`,
                 );
             }
 
-            // History ga qo'shish
             document.history.push({
                 userId: user._id,
                 comment: data.comment,
@@ -244,16 +253,13 @@ export class ApprovalService {
                 timestamp: new Date(),
             });
 
-            // Keyingi step bormi?
             const nextStepIndex = currentStepIndex + 1;
             const hasMoreSteps = nextStepIndex < workflow.steps.length;
 
             if (hasMoreSteps) {
-                // Yana steplar bor - IN_REVIEW holatida qoladi
                 document.status = DocumentStatus.IN_REVIEW;
                 document.currentStep = nextStepIndex;
             } else {
-                // Hamma steplar tugadi - WAITING_APPROVAL ga o'tadi
                 document.status = DocumentStatus.WAITING_APPROVAL;
                 document.currentStep = workflow.steps.length;
             }
@@ -261,7 +267,7 @@ export class ApprovalService {
             await document.save({ session });
             await session.commitTransaction();
 
-            // WebSocket notification
+            // WebSocket notification - global status change
             this.documentGateway.notifyDocumentStatusChange(
                 document._id.toString(),
                 document.status,
@@ -272,6 +278,11 @@ export class ApprovalService {
                     actorId: user._id.toString(),
                 },
             );
+
+            // Keyingi step userlariga xabarnoma yuborish
+            if (hasMoreSteps) {
+                await this.notifyWorkflowStepUsers(document, workflow);
+            }
 
             const message = hasMoreSteps
                 ? `Document reviewed successfully. Step ${nextStepIndex}/${workflow.steps.length} - awaiting ${workflow.steps[nextStepIndex].role} review`
@@ -298,10 +309,6 @@ export class ApprovalService {
         }
     }
 
-    /**
-     * Handle approval or rejection
-     * WAITING_APPROVAL → APPROVED or DRAFT
-     */
     async handleApproval(
         req: RequestWithUser,
         documentId: string,
@@ -309,7 +316,6 @@ export class ApprovalService {
     ) {
         const { action, comment } = payload;
 
-        // Validate action
         if (!['APPROVE', 'REJECT'].includes(action)) {
             throw new BadRequestException('Invalid action. Must be "APPROVE" or "REJECT"');
         }
@@ -319,7 +325,6 @@ export class ApprovalService {
             throw new BadRequestException('Document not found');
         }
 
-        // Faqat WAITING_APPROVAL statusida approve/reject mumkin
         if (document.status !== DocumentStatus.WAITING_APPROVAL) {
             throw new BadRequestException(
                 `Cannot ${action.toLowerCase()} document in ${document.status} status. Must be WAITING_APPROVAL.`,
@@ -333,10 +338,6 @@ export class ApprovalService {
         }
     }
 
-    /**
-     * Final approval - business logic execute + PDF generate
-     * WAITING_APPROVAL → APPROVED
-     */
     private async approveDocument(
         req: RequestWithUser,
         document: HydratedDocument<DocumentEntity>,
@@ -354,7 +355,6 @@ export class ApprovalService {
                 throw new BadRequestException('User not found');
             }
 
-            // Faqat APPROVER, ADMIN, SUPER_ADMIN
             const allowedRoles = [UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
             if (!allowedRoles.includes(user.role)) {
                 throw new ForbiddenException(
@@ -372,10 +372,8 @@ export class ApprovalService {
                 );
             }
 
-            // Execute business logic (expense, leave, asset)
             await this.documentService.executeBusinessLogic(freshDoc, session);
 
-            // Status ni APPROVED ga o'zgartirish
             freshDoc.status = DocumentStatus.APPROVED;
             freshDoc.history.push({
                 userId: user._id,
@@ -387,7 +385,6 @@ export class ApprovalService {
             await freshDoc.save({ session });
             await session.commitTransaction();
 
-            // WebSocket notification
             this.documentGateway.notifyDocumentStatusChange(
                 freshDoc._id.toString(),
                 freshDoc.status,
@@ -397,12 +394,10 @@ export class ApprovalService {
                 },
             );
 
-            // PDF generation queue ga qo'shish
             await this.pdfQueue.add('generate-pdf', {
                 documentId: freshDoc._id.toString(),
             });
 
-            // Creator ga notification
             this.documentGateway.notifyUser(
                 freshDoc.creatorId.toString(),
                 'document:approved',
@@ -435,10 +430,6 @@ export class ApprovalService {
         }
     }
 
-    /**
-     * Reject document
-     * WAITING_APPROVAL → DRAFT
-     */
     private async rejectDocument(
         req: RequestWithUser,
         document: HydratedDocument<DocumentEntity>,
@@ -456,7 +447,6 @@ export class ApprovalService {
                 throw new BadRequestException('User not found');
             }
 
-            // Faqat APPROVER, ADMIN, SUPER_ADMIN
             const allowedRoles = [UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPER_ADMIN];
             if (!allowedRoles.includes(user.role)) {
                 throw new ForbiddenException(
@@ -472,7 +462,6 @@ export class ApprovalService {
                 throw new BadRequestException('Document not found');
             }
 
-            // Status ni DRAFT ga qaytarish
             freshDoc.status = DocumentStatus.DRAFT;
             freshDoc.currentStep = 0;
             freshDoc.rejectionReason = comment;
@@ -486,7 +475,6 @@ export class ApprovalService {
             await freshDoc.save({ session });
             await session.commitTransaction();
 
-            // WebSocket notification
             this.documentGateway.notifyDocumentStatusChange(
                 freshDoc._id.toString(),
                 freshDoc.status,
@@ -496,7 +484,6 @@ export class ApprovalService {
                 },
             );
 
-            // Creator ga notification
             this.documentGateway.notifyUser(
                 freshDoc.creatorId.toString(),
                 'document:rejected',
@@ -527,6 +514,133 @@ export class ApprovalService {
             );
         } finally {
             session.endSession();
+        }
+    }
+
+    private getStepIndexByStatus(status: DocumentStatus): number {
+        switch (status) {
+            case DocumentStatus.SUBMITTED:
+                return 0;
+            case DocumentStatus.IN_REVIEW:
+                return 1;
+            case DocumentStatus.WAITING_APPROVAL:
+                return 2;
+            default:
+                return -1;
+        }
+    }
+
+    private getUniqueRolesUntilStep(
+        steps: { stepOrder: number, role: UserRole, label: string }[], 
+        stepIndex: number
+    ) {
+        const roles: string[] = [];
+
+        for (let i = 0; i <= stepIndex; i++) {
+            const role = steps[i].role;
+
+            if (roles[roles.length - 1] !== role) {
+                roles.push(role);
+            }
+        }
+
+        return roles;
+    }
+
+    async notifyDocumentForChecking() {
+        try {
+            Logger.log('🔔 Starting document check notifications...');
+
+            const documents = await this.documentModel.find({
+                status: { $nin: ['DRAFT', 'APPROVED', 'REJECTED'] }
+            });
+
+            Logger.log(`📄 Found ${documents.length} documents to notify`);
+
+            const notifications = [];
+
+            for (const document of documents) {
+                const workflow = await this.workflowModel.findOne({
+                    documentType: document.type,
+                    isActive: true
+                });
+
+                if (!workflow) {
+                    Logger.warn(`⚠️ No workflow found for document ${document._id}`);
+                    continue;
+                }
+
+                const stepIndex = this.getStepIndexByStatus(document.status);
+                if (stepIndex === -1) {
+                    Logger.warn(`⚠️ Invalid status for document ${document._id}: ${document.status}`);
+                    continue;
+                }
+
+                const roles = this.getUniqueRolesUntilStep(
+                    workflow.steps,
+                    stepIndex
+                );
+
+                for (const role of roles) {
+                    const users = await this.userModel.find({ role });
+
+                    for (const user of users) {
+                        const notification = {
+                            documentId: document._id.toString(),
+                            userId: user._id.toString(),
+                            role,
+                            message: `Document ${document.serialNumber} is waiting for your review`,
+                            serialNumber: document.serialNumber,
+                            documentType: document.type,
+                            status: document.status
+                        };
+
+                        notifications.push(notification);
+                    }
+                }
+            }
+
+            Logger.log(`📨 Prepared ${notifications.length} notifications`);
+
+            if (notifications.length > 0) {
+                const result = this.documentGateway.broadcastDocumentCheckNotifications(notifications);
+                
+                Logger.log(
+                    `✅ Notification complete: ${result.sentCount} sent, ${result.failedCount} failed`
+                );
+            }
+
+            return notifications;
+
+        } catch (error) {
+            Logger.error('❌ Error in notifyDocumentForChecking:', error);
+            throw error;
+        }
+    }
+
+    async notifyDocumentStatusUpdate(documentId: string, newStatus: DocumentStatus) {
+        try {
+            const document = await this.documentModel.findById(documentId);
+            
+            if (!document) {
+                throw new Error('Document not found');
+            }
+
+            this.documentGateway.notifyDocumentStatusChange(
+                documentId,
+                newStatus,
+                {
+                    serialNumber: document.serialNumber,
+                    documentType: document.type,
+                    previousStatus: document.status
+                }
+            );
+
+            Logger.log(`📢 Notified status change for document ${documentId}: ${newStatus}`);
+
+        } catch (error) {
+            Logger.error('❌ Error notifying status update:', error);
+            throw error;
         }
     }
 }

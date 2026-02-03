@@ -10,6 +10,25 @@ import { IoAdapter } from '@nestjs/platform-socket.io';
 import { AllExceptionFilter } from 'src/common/filters/all.exception.filter';
 import cookieParser from 'cookie-parser';
 import { runSeeder } from 'src/database/runSeeders';
+import { ServerOptions } from 'socket.io';
+
+class SocketIoAdapter extends IoAdapter {
+  createIOServer(port: number, options?: ServerOptions): any {
+    const server = super.createIOServer(port, {
+      ...options,
+      cors: {
+        origin: config.NODE_ENV === 'production' 
+          ? [config.FRONTEND_URL || 'http://localhost:5173'] 
+          : '*',
+        credentials: true, // Cookie lardan foydalanishga ruxsat beradi
+        methods: ['GET', 'POST'],
+      },
+      transports: ['websocket', 'polling'],
+      allowEIO3: true,
+    });
+    return server; // Socket.IO serverini yaratish va sozlash
+  }
+} // SocketIoAdapter - Socket.IO serverini sozlash uchun maxsus adapter
 
 @Injectable()
 export default class Application {
@@ -20,7 +39,7 @@ export default class Application {
       logger: ['log', 'error', 'warn', 'debug', 'verbose']
     })
 
-    app.use(cookieParser())
+    app.use(cookieParser()) // Cookie parser middlewarening vazifasi cookie lardagi ma'lumotlarni o'qish va boshqarishdir. Misol uchun, foydalanuvchi sessiya ma'lumotlarini cookie larda saqlash va ularni so'rovlar davomida o'qish uchun ishlatiladi.
 
     runSeeder()
 
@@ -47,7 +66,7 @@ export default class Application {
         return originalJson.call(this, serializeData(data));
       }
       next()
-    });
+    }); // ushbu middleware barcha javoblardagi Date obyektlarini ISO string formatiga o'zgartiradi
 
     app.useGlobalFilters(new AllExceptionFilter())
 
@@ -60,11 +79,14 @@ export default class Application {
 
     app.useGlobalPipes(
       new ValidationPipe({
-        whitelist: true,
-        forbidNonWhitelisted: false,
-        transform: true,
+        whitelist: true, // DTO larda ko'rsatilmagan maydonlarni avtomatik ravishda rad etadi
+        forbidNonWhitelisted: false, // noma'lum maydonlar bo'lsa xatolik qaytarmaslik
+        transform: true, // DTO lariga kelayotgan ma'lumotlarni avtomatik ravishda kerakli turlarga o'zgartirishni yoqadi
         transformOptions: {
-          enableImplicitConversion: true,
+          enableImplicitConversion: true, // DTO larida primitive turlarini avtomatik o'zgartirishga ruxsat beradi
+          // misol uchun: string dan number ga yoki string dan boolean ga
+          // shu bilan birga, faqat quyidagi primitive turlar uchun ishlaydi:
+          // primitive turlar: string, number, boolean, bigint, symbol
         },
       }),
     );
@@ -97,13 +119,13 @@ export default class Application {
     const document = SwaggerModule.createDocument(app, swaggerConfig)
     SwaggerModule.setup('api', app, document, {
       swaggerOptions: {
-        persistAuthorization: true
+        persistAuthorization: true // refresh bo'lganda swagger authorization ni saqlab qolish
       }
     })
 
-    app.useWebSocketAdapter(new IoAdapter(app))
+    app.useWebSocketAdapter(new SocketIoAdapter(app))
 
-    const httpAdapter = app.getHttpAdapter()
+    const httpAdapter = app.getHttpAdapter() // Express application instance ni olish
     httpAdapter.get('/health', (req: any, res: any) => {
       res.status(200).send({
         status: 'ok',
@@ -120,7 +142,7 @@ export default class Application {
     this.logger.log(`Server running on http://localhost:${port}`);
     this.logger.log(`Swagger Docs: http://localhost:${port}/api`);
     this.logger.log(`Health Check: http://localhost:${port}/health`);
-    // this.logger.log(`Telegram Bot: Active`);
+    this.logger.log(`WebSocket: Active on ws://localhost:${port}`);
     this.logger.log(`Environment: ${config.NODE_ENV || 'development'}`);
   }
 }

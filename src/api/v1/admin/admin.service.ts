@@ -10,6 +10,7 @@ import { BcryptEncryption } from '@common/infrastructure/bcrypt';
 import { UserRole } from '@common/constants';
 import * as XLSX from 'xlsx';
 import * as bcrypt from 'bcrypt';
+import { MailService } from 'src/services/mail.service';
 
 interface ExcelUser {
   email: string;
@@ -36,7 +37,7 @@ interface CreateUserResult {
 
 @Injectable()
 export class AdminService extends BaseService<HydratedDocument<User>, CreateAdminDto, UpdateAdminDto> {
-  constructor(@InjectModel(User.name) userModel: Model<HydratedDocument<User>>) {
+  constructor(@InjectModel(User.name) userModel: Model<HydratedDocument<User>>, private readonly mailService: MailService) {
     super(userModel)
   }
 
@@ -44,6 +45,20 @@ export class AdminService extends BaseService<HydratedDocument<User>, CreateAdmi
     try {
       const findone = await this.model.findOne({ email: createUserDto.email });
       if (findone) throw new BadRequestException('User already exists!');
+
+      await this.mailService.addMailToQueue(
+        createUserDto.email,
+        'Welcome to SmartFlow',
+        'Your account has been created successfully.',
+        `<p>Hello ${createUserDto.fullName},
+        <br/>
+        Here are your login details:
+        <br/>
+        Your email: ${createUserDto.email}
+        <br/>
+        Your password: ${createUserDto.password}
+        </p>...`
+      );
 
       const user = await this.model.create({
         ...createUserDto,
@@ -254,7 +269,7 @@ export class AdminService extends BaseService<HydratedDocument<User>, CreateAdmi
         data: updatedAdmin,
       }
     } catch (error) {
-      if(error instanceof BadRequestException) throw error
+      if (error instanceof BadRequestException) throw error
       throw new InternalServerErrorException(error.message || 'Internal server error!')
     }
   }
