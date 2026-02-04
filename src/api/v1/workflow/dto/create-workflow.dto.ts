@@ -4,9 +4,9 @@ import { DocumentType, UserRole } from '@common/constants';
 import { Type } from 'class-transformer';
 
 export class WorkflowStepDto {
-    @ApiProperty({ example: 1 })
+    @ApiProperty({ example: 0 })
     @IsInt()
-    @Min(1)
+    @Min(0)
     stepOrder: number;
 
     @ApiProperty({ enum: UserRole, example: UserRole.ADMIN })

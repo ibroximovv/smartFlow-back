@@ -20,7 +20,8 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
   private userSockets: Map<string, Socket> = new Map();
   private socketToUser: Map<string, string> = new Map();
 
-  constructor(private jwtService: JwtService,
+  constructor(
+    private jwtService: JwtService,
     @Inject(forwardRef(() => ApprovalService))
     private approvalService: ApprovalService
   ) { }
@@ -69,7 +70,7 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       this.userSockets.set(userId, client);
       this.socketToUser.set(client.id, userId);
 
-      this.logger.log(`✅ User ${userId} authenticated and connected`);
+      this.logger.log(`✅ User ${userId} (${decoded.role}) authenticated and connected`);
 
       client.emit('connected', {
         message: 'Successfully authenticated',
@@ -160,14 +161,14 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     const userId = (client as any).userId;
     const userRole = (client as any).user?.role;
 
-    if (userRole !== 'ADMIN') {
+    if (userRole !== 'ADMIN' && userRole !== 'SUPER_ADMIN') {
       client.emit('error', {
         message: 'Permission denied. Only admins can trigger notifications'
       });
       return;
     }
 
-    this.logger.log(`🔔 User ${userId} manually triggered document check`);
+    this.logger.log(`🔔 User ${userId} (${userRole}) manually triggered document check`);
 
     try {
       const notifications = await this.approvalService.notifyDocumentForChecking();
@@ -200,7 +201,7 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       currentStep?: number;
       totalSteps?: number;
     }
-  ) {
+  ): boolean {
     const socket = this.userSockets.get(userId);
 
     if (socket) {
@@ -208,10 +209,10 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
         ...notification,
         timestamp: new Date()
       });
-      this.logger.log(`📨 Sent check notification to user ${userId} for document ${notification.documentId}`);
+      this.logger.log(`📨 Sent notification to user ${userId} for document ${notification.serialNumber}`);
       return true;
     } else {
-      this.logger.warn(`⚠️ User ${userId} is not connected`);
+      this.logger.warn(`⚠️ User ${userId} is not connected (offline)`);
       return false;
     }
   }
@@ -223,41 +224,48 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     status: string,
     currentStep: number,
     workflowSteps: Array<{ stepOrder: number; role: string; label: string }>,
-    usersByRole: Map<string, string[]> // role -> userId[]
+    usersByRole: Map<string, string[]>
   ) {
-    this.logger.log(`🔔 Notifying workflow users for document ${serialNumber} (${status})`);
+    this.logger.log(`🔔 Notifying workflow users for document ${serialNumber}`);
+    this.logger.log(`📍 Status: ${status}, Current step: ${currentStep}, Total steps: ${workflowSteps.length}`);
 
     let notifiedCount = 0;
     let failedCount = 0;
 
-    // Joriy step va undan keyingi steplar uchun userlarni xabardor qilish
-    const relevantSteps = workflowSteps.filter(step => step.stepOrder >= currentStep + 1);
+    const targetStep = workflowSteps.find(step => step.stepOrder === currentStep);
 
-    for (const step of relevantSteps) {
-      const userIds = usersByRole.get(step.role) || [];
+    if (!targetStep) {
+      this.logger.warn(`⚠️ No step found with stepOrder ${currentStep}`);
+      return { notifiedCount: 0, failedCount: 0 };
+    }
 
-      for (const userId of userIds) {
-        const success = this.notifyUserForDocumentCheck(userId, {
-          documentId,
-          documentType,
-          serialNumber,
-          status,
-          role: step.role,
-          message: `New document "${serialNumber}" is waiting for ${step.label}`,
-          currentStep: step.stepOrder,
-          totalSteps: workflowSteps.length
-        });
+    this.logger.log(`🎯 Target step: ${targetStep.label} (Role: ${targetStep.role}, Order: ${targetStep.stepOrder})`);
 
-        if (success) {
-          notifiedCount++;
-        } else {
-          failedCount++;
-        }
+    const userIds = usersByRole.get(targetStep.role) || [];
+    
+    this.logger.log(`👥 Found ${userIds.length} users with role ${targetStep.role}`);
+
+    for (const userId of userIds) {
+      const success = this.notifyUserForDocumentCheck(userId, {
+        documentId,
+        documentType,
+        serialNumber,
+        status,
+        role: targetStep.role,
+        message: `📄 New document "${serialNumber}" is waiting for ${targetStep.label}`,
+        currentStep: targetStep.stepOrder,
+        totalSteps: workflowSteps.length
+      });
+
+      if (success) {
+        notifiedCount++;
+      } else {
+        failedCount++;
       }
     }
 
     this.logger.log(
-      `📊 Workflow notification summary: ${notifiedCount} sent, ${failedCount} failed (users offline)`
+      `📊 Workflow notification result: ${notifiedCount} sent, ${failedCount} failed (offline users)`
     );
 
     return { notifiedCount, failedCount };
@@ -274,6 +282,8 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       status?: string;
     }>
   ) {
+    this.logger.log(`📢 Broadcasting ${notifications.length} notifications...`);
+
     let sentCount = 0;
     let failedCount = 0;
 
@@ -298,14 +308,15 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     }
 
     this.logger.log(
-      `📊 Notification summary: ${sentCount} sent, ${failedCount} failed (users offline)`
+      `📊 Broadcast result: ${sentCount} sent, ${failedCount} failed (offline users)`
     );
 
     return { sentCount, failedCount, total: notifications.length };
   }
 
   notifyDocumentStatusChange(documentId: string, status: string, details: any) {
-    this.logger.log(`📢 Broadcasting status change for document ${documentId}`);
+    this.logger.log(`📢 Broadcasting status change for document ${documentId}: ${status}`);
+    
     this.server.emit('document:statusChanged', {
       documentId,
       status,
@@ -316,16 +327,21 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
 
   notifyUser(userId: string, eventName: string, data: any) {
     const socket = this.userSockets.get(userId);
+    
     if (socket) {
-      socket.emit(eventName, data);
-      this.logger.log(`📨 Notified user ${userId} with event: ${eventName}`);
+      socket.emit(eventName, {
+        timestamp: new Date(),
+        ...data
+      });
+      this.logger.log(`📨 Sent ${eventName} to user ${userId}`);
     } else {
-      this.logger.warn(`⚠️ User ${userId} is not connected`);
+      this.logger.warn(`⚠️ Cannot notify user ${userId} - not connected`);
     }
   }
 
   broadcastNotification(eventName: string, data: any) {
-    this.logger.log(`📢 Broadcasting: ${eventName}`);
+    this.logger.log(`📢 Broadcasting event: ${eventName}`);
+    
     this.server.emit(eventName, {
       timestamp: new Date(),
       ...data,
@@ -335,10 +351,19 @@ export class DocumentGateway implements OnGatewayInit, OnGatewayConnection, OnGa
   notifyDocumentObservers(documentId: string, eventName: string, data: any) {
     const room = `document:${documentId}`;
     this.logger.log(`📢 Notifying room ${room} with event: ${eventName}`);
+    
     this.server.to(room).emit(eventName, {
       documentId,
       timestamp: new Date(),
       ...data,
     });
+  }
+
+  getConnectedUsersCount(): number {
+    return this.userSockets.size;
+  }
+
+  isUserOnline(userId: string): boolean {
+    return this.userSockets.has(userId);
   }
 }

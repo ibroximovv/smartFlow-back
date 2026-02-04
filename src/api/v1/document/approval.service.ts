@@ -48,6 +48,8 @@ function formatDocument(doc: HydratedDocument<DocumentEntity>) {
 
 @Injectable()
 export class ApprovalService {
+    private readonly logger = new Logger(ApprovalService.name);
+
     constructor(
         @InjectModel(DocumentEntity.name)
         private documentModel: Model<HydratedDocument<DocumentEntity>>,
@@ -64,21 +66,25 @@ export class ApprovalService {
         workflow: HydratedDocument<Workflow>,
     ) {
         try {
-            // Userlarni role bo'yicha guruhlash
+            this.logger.log(`🔔 Notifying workflow users for document ${document.serialNumber}`);
+            this.logger.log(`📍 Current step: ${document.currentStep}, Status: ${document.status}`);
+
             const usersByRole = new Map<string, string[]>();
 
             for (const step of workflow.steps) {
-                const users = await this.userModel.find({ role: step.role });
-                const userIds = users.map(u => u._id.toString());
-                
+                // Agar bu role uchun hali users yuklanmagan bo'lsa
                 if (!usersByRole.has(step.role)) {
-                    usersByRole.set(step.role, []);
+                    const users = await this.userModel.find({ role: step.role });
+                    const userIds = users.map(u => u._id.toString());
+                    usersByRole.set(step.role, userIds);
+                    this.logger.log(`👥 Found ${userIds.length} users with role ${step.role}`);
                 }
-                usersByRole.get(step.role)?.push(...userIds);
             }
 
+            this.logger.log(`📊 Total unique roles: ${usersByRole.size}`);
+
             // Gateway orqali notification yuborish
-            await this.documentGateway.notifyWorkflowUsers(
+            const result = await this.documentGateway.notifyWorkflowUsers(
                 document._id.toString(),
                 document.type,
                 document.serialNumber,
@@ -88,9 +94,12 @@ export class ApprovalService {
                 usersByRole
             );
 
-            Logger.log(`🔔 Notified workflow users for document ${document.serialNumber}`);
+            this.logger.log(`✅ Notified ${result.notifiedCount} users, ${result.failedCount} offline`);
+
+            return result;
         } catch (error) {
-            Logger.error('❌ Error notifying workflow users:', error);
+            this.logger.error('❌ Error notifying workflow users:', error);
+            throw error;
         }
     }
 
@@ -143,7 +152,7 @@ export class ApprovalService {
             }
 
             document.status = DocumentStatus.SUBMITTED;
-            document.currentStep = 0;
+            document.currentStep = 0; // ✅ Birinchi step
             document.history.push({
                 userId: creator._id,
                 comment: data.comment,
@@ -153,6 +162,8 @@ export class ApprovalService {
 
             await document.save({ session });
             await session.commitTransaction();
+
+            this.logger.log(`✅ Document ${document.serialNumber} submitted successfully`);
 
             // WebSocket notification - global status change
             this.documentGateway.notifyDocumentStatusChange(
@@ -165,7 +176,6 @@ export class ApprovalService {
                 },
             );
 
-            // Workflow userlariga xabarnoma yuborish
             await this.notifyWorkflowStepUsers(document, workflow);
 
             return {
@@ -246,6 +256,8 @@ export class ApprovalService {
                 );
             }
 
+            this.logger.log(`📝 User ${user._id} (${user.role}) reviewing document at step ${currentStepIndex}`);
+
             document.history.push({
                 userId: user._id,
                 comment: data.comment,
@@ -258,10 +270,12 @@ export class ApprovalService {
 
             if (hasMoreSteps) {
                 document.status = DocumentStatus.IN_REVIEW;
-                document.currentStep = nextStepIndex;
+                document.currentStep = nextStepIndex; // ✅ Keyingi stepga o'tish
+                this.logger.log(`➡️ Moving to next step: ${nextStepIndex}/${workflow.steps.length}`);
             } else {
                 document.status = DocumentStatus.WAITING_APPROVAL;
                 document.currentStep = workflow.steps.length;
+                this.logger.log(`✅ All review steps completed, waiting for final approval`);
             }
 
             await document.save({ session });
@@ -279,13 +293,12 @@ export class ApprovalService {
                 },
             );
 
-            // Keyingi step userlariga xabarnoma yuborish
             if (hasMoreSteps) {
                 await this.notifyWorkflowStepUsers(document, workflow);
             }
 
             const message = hasMoreSteps
-                ? `Document reviewed successfully. Step ${nextStepIndex}/${workflow.steps.length} - awaiting ${workflow.steps[nextStepIndex].role} review`
+                ? `Document reviewed successfully. Step ${nextStepIndex + 1}/${workflow.steps.length} - awaiting ${workflow.steps[nextStepIndex].role} review`
                 : 'All review steps completed. Awaiting final approval from APPROVER';
 
             return {
@@ -372,6 +385,8 @@ export class ApprovalService {
                 );
             }
 
+            this.logger.log(`✅ Approving document ${freshDoc.serialNumber}`);
+
             await this.documentService.executeBusinessLogic(freshDoc, session);
 
             freshDoc.status = DocumentStatus.APPROVED;
@@ -408,6 +423,8 @@ export class ApprovalService {
                     message: 'Your document has been approved. PDF generation in progress.',
                 }
             );
+
+            this.logger.log(`🎉 Document ${freshDoc.serialNumber} approved successfully`);
 
             return {
                 statusCode: 200,
@@ -462,6 +479,8 @@ export class ApprovalService {
                 throw new BadRequestException('Document not found');
             }
 
+            this.logger.log(`❌ Rejecting document ${freshDoc.serialNumber}`);
+
             freshDoc.status = DocumentStatus.DRAFT;
             freshDoc.currentStep = 0;
             freshDoc.rejectionReason = comment;
@@ -496,6 +515,8 @@ export class ApprovalService {
                 }
             );
 
+            this.logger.log(`🔄 Document ${freshDoc.serialNumber} returned to DRAFT`);
+
             return {
                 statusCode: 200,
                 message: 'Document rejected and returned to DRAFT. Creator can edit and resubmit.',
@@ -517,45 +538,15 @@ export class ApprovalService {
         }
     }
 
-    private getStepIndexByStatus(status: DocumentStatus): number {
-        switch (status) {
-            case DocumentStatus.SUBMITTED:
-                return 0;
-            case DocumentStatus.IN_REVIEW:
-                return 1;
-            case DocumentStatus.WAITING_APPROVAL:
-                return 2;
-            default:
-                return -1;
-        }
-    }
-
-    private getUniqueRolesUntilStep(
-        steps: { stepOrder: number, role: UserRole, label: string }[], 
-        stepIndex: number
-    ) {
-        const roles: string[] = [];
-
-        for (let i = 0; i <= stepIndex; i++) {
-            const role = steps[i].role;
-
-            if (roles[roles.length - 1] !== role) {
-                roles.push(role);
-            }
-        }
-
-        return roles;
-    }
-
     async notifyDocumentForChecking() {
         try {
-            Logger.log('🔔 Starting document check notifications...');
+            this.logger.log('🔔 Starting document check notifications...');
 
             const documents = await this.documentModel.find({
-                status: { $nin: ['DRAFT', 'APPROVED', 'REJECTED'] }
+                status: { $nin: [DocumentStatus.DRAFT, DocumentStatus.APPROVED] }
             });
 
-            Logger.log(`📄 Found ${documents.length} documents to notify`);
+            this.logger.log(`📄 Found ${documents.length} documents to notify`);
 
             const notifications = [];
 
@@ -566,46 +557,40 @@ export class ApprovalService {
                 });
 
                 if (!workflow) {
-                    Logger.warn(`⚠️ No workflow found for document ${document._id}`);
+                    this.logger.warn(`⚠️ No workflow found for document ${document._id}`);
                     continue;
                 }
 
-                const stepIndex = this.getStepIndexByStatus(document.status);
-                if (stepIndex === -1) {
-                    Logger.warn(`⚠️ Invalid status for document ${document._id}: ${document.status}`);
+                const currentStep = workflow.steps[document.currentStep];
+
+                if (!currentStep) {
+                    this.logger.warn(`⚠️ Invalid step ${document.currentStep} for document ${document._id}`);
                     continue;
                 }
 
-                const roles = this.getUniqueRolesUntilStep(
-                    workflow.steps,
-                    stepIndex
-                );
+                const users = await this.userModel.find({ role: currentStep.role });
 
-                for (const role of roles) {
-                    const users = await this.userModel.find({ role });
+                for (const user of users) {
+                    const notification = {
+                        documentId: document._id.toString(),
+                        userId: user._id.toString(),
+                        role: currentStep.role,
+                        message: `Document ${document.serialNumber} is waiting for your ${currentStep.label}`,
+                        serialNumber: document.serialNumber,
+                        documentType: document.type,
+                        status: document.status
+                    };
 
-                    for (const user of users) {
-                        const notification = {
-                            documentId: document._id.toString(),
-                            userId: user._id.toString(),
-                            role,
-                            message: `Document ${document.serialNumber} is waiting for your review`,
-                            serialNumber: document.serialNumber,
-                            documentType: document.type,
-                            status: document.status
-                        };
-
-                        notifications.push(notification);
-                    }
+                    notifications.push(notification);
                 }
             }
 
-            Logger.log(`📨 Prepared ${notifications.length} notifications`);
+            this.logger.log(`📨 Prepared ${notifications.length} notifications`);
 
             if (notifications.length > 0) {
                 const result = this.documentGateway.broadcastDocumentCheckNotifications(notifications);
                 
-                Logger.log(
+                this.logger.log(
                     `✅ Notification complete: ${result.sentCount} sent, ${result.failedCount} failed`
                 );
             }
@@ -613,7 +598,7 @@ export class ApprovalService {
             return notifications;
 
         } catch (error) {
-            Logger.error('❌ Error in notifyDocumentForChecking:', error);
+            this.logger.error('❌ Error in notifyDocumentForChecking:', error);
             throw error;
         }
     }
@@ -636,10 +621,10 @@ export class ApprovalService {
                 }
             );
 
-            Logger.log(`📢 Notified status change for document ${documentId}: ${newStatus}`);
+            this.logger.log(`📢 Notified status change for document ${documentId}: ${newStatus}`);
 
         } catch (error) {
-            Logger.error('❌ Error notifying status update:', error);
+            this.logger.error('❌ Error notifying status update:', error);
             throw error;
         }
     }
